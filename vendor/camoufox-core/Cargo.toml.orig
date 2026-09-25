@@ -1,0 +1,25 @@
+[package]
+name = "camoufox-core"
+description = "Pure domain layer for camoufox-rust: errors, OS types, mappings, fingerprints, config, locale"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["camoufox", "fingerprint", "browserforge", "locale", "cldr"]
+categories = ["web-programming"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+quick-xml.workspace = true
+veilus-fingerprint.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

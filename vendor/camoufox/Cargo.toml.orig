@@ -1,0 +1,30 @@
+[package]
+name = "camoufox"
+description = "Facade crate for camoufox-rust: LaunchOptions, PreparedLaunch, launch, proxy-auth. Inspired by camoufox-js (https://github.com/apify/camoufox-js) and Camoufox (https://github.com/daijro/camoufox)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["camoufox", "antidetect", "fingerprint", "browser", "playwright"]
+categories = ["web-programming"]
+
+[dependencies]
+camoufox-core.workspace = true
+camoufox-pkgman.workspace = true
+camoufox-geoip.workspace = true
+camoufox-webgl.workspace = true
+camoufox-virtdisplay.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+tempfile.workspace = true
+rand.workspace = true
+veilus-fingerprint.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

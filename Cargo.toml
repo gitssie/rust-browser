@@ -1,0 +1,44 @@
+[package]
+name = "rust-browser"
+version = "0.1.0"
+edition = "2024"
+description = "Native CLI for persistent Camoufox browser profiles"
+
+[[bin]]
+name = "browserctl-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+camoufox = "=0.9.1"
+camoufox-core = "=0.9.1"
+camoufox-geoip = "=0.9.1"
+camoufox-juggler = "=0.9.1"
+camoufox-pkgman = "=0.9.1"
+camoufox-store = { version = "=0.9.1", default-features = false }
+clap = { version = "4", features = ["derive", "env"] }
+directories = "6"
+env_logger = "0.11"
+fs2 = "0.4"
+rand = "0.8"
+regex = "1"
+# camoufox-geoip uses reqwest for proxy IP checks; enable its SOCKS backend.
+reqwest = { version = "=0.12.28", default-features = false, features = ["socks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[patch.crates-io]
+# Keep all eight camoufox-rust 0.9.1 crates together at one local revision.
+camoufox = { path = "vendor/camoufox" }
+camoufox-core = { path = "vendor/camoufox-core" }
+camoufox-geoip = { path = "vendor/camoufox-geoip" }
+camoufox-juggler = { path = "vendor/camoufox-juggler" }
+camoufox-pkgman = { path = "vendor/camoufox-pkgman" }
+camoufox-store = { path = "vendor/camoufox-store" }
+camoufox-virtdisplay = { path = "vendor/camoufox-virtdisplay" }
+camoufox-webgl = { path = "vendor/camoufox-webgl" }

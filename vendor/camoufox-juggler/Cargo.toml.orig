@@ -1,0 +1,46 @@
+[package]
+name = "camoufox-juggler"
+description = "Native Rust client for Firefox's Juggler automation protocol (pipe transport, browser/page sessions, fingerprint verification)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["camoufox", "juggler", "firefox", "automation", "cdp"]
+categories = ["web-programming", "asynchronous"]
+
+[dependencies]
+camoufox-core.workspace = true
+camoufox.workspace = true
+camoufox-store.workspace = true
+camoufox-virtdisplay.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+futures-util.workspace = true
+rand.workspace = true
+base64 = "0.22"
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+env_logger.workspace = true
+
+[lib]
+name = "camoufox_juggler"

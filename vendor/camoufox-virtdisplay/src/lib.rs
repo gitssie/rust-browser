@@ -1,0 +1,385 @@
+//! # camoufox-virtdisplay
+//!
+//! Xvfb virtual display management (Linux only).
+//!
+//! Xvfb is launched with `-displayfd 3` so the kernel/Xvfb itself picks a free
+//! display number atomically and reports it back through file descriptor 3 —
+//! no userspace race conditions. Mesa software GLX is forced via the
+//! environment since the GPU is not used.
+//!
+//! The implementation only compiles on Linux; on other hosts the API returns
+//! [`camoufox_core::error::CamoufoxError::VirtualDisplayNotSupported`].
+
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+
+use camoufox_core::error::{CamoufoxError, Result};
+#[cfg(target_os = "linux")]
+use tokio::io::AsyncBufReadExt;
+
+/// Timeout for Xvfb writing its display number (prevents infinite hangs).
+#[cfg(target_os = "linux")]
+const DISPLAYFD_READ_TIMEOUT_MS: u64 = 10_000;
+
+/// A managed Xvfb virtual display.
+pub struct VirtualDisplay {
+    #[cfg(target_os = "linux")]
+    debug: bool,
+    #[cfg(target_os = "linux")]
+    proc: Option<tokio::process::Child>,
+    #[cfg(target_os = "linux")]
+    display: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+impl VirtualDisplay {
+    /// Creates an unstarted virtual display handle.
+    pub fn new(debug: bool) -> Self {
+        Self {
+            debug,
+            proc: None,
+            display: None,
+        }
+    }
+
+    /// Xvfb arguments: minimal screen, no extensions, software rendering.
+    fn xvfb_args() -> Vec<String> {
+        [
+            "-screen",
+            "0",
+            "1x1x24",
+            "-ac",
+            "-nolisten",
+            "tcp",
+            "-extension",
+            "RENDER",
+            "+extension",
+            "GLX",
+            "-extension",
+            "COMPOSITE",
+            "-extension",
+            "XVideo",
+            "-extension",
+            "XVideo-MotionCompensation",
+            "-extension",
+            "XINERAMA",
+            "-fp",
+            "built-ins",
+            "-nocursor",
+            "-br",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// Resolves the Xvfb executable path.
+    fn xvfb_path(&self) -> Result<String> {
+        let output = std::process::Command::new("which")
+            .arg("Xvfb")
+            .output()
+            .map_err(|_| CamoufoxError::cannot_find_xvfb())?;
+        if !output.status.success() {
+            return Err(CamoufoxError::cannot_find_xvfb());
+        }
+        let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if resolved.is_empty() {
+            return Err(CamoufoxError::cannot_find_xvfb());
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&resolved)
+            .map_err(|_| CamoufoxError::cannot_find_xvfb())?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            return Err(CamoufoxError::CannotExecuteXvfb(format!(
+                "I do not have permission to execute Xvfb: {resolved}"
+            )));
+        }
+        Ok(resolved)
+    }
+
+    /// Spawns Xvfb with `-displayfd 3`, waits for the display number and
+    /// returns `":<n>"`.
+    async fn spawn_xvfb(&mut self) -> Result<String> {
+        let xvfb_path = self.xvfb_path()?;
+
+        let mut args = vec!["-displayfd".to_string(), "3".to_string()];
+        args.extend(Self::xvfb_args());
+        if self.debug {
+            println!("Starting virtual display: {xvfb_path} {}", args.join(" "));
+        }
+
+        let mut command = tokio::process::Command::new(&xvfb_path);
+        command
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(if self.debug {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .stderr(if self.debug {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .env("__GLX_VENDOR_LIBRARY_NAME", "mesa")
+            .env("LIBGL_ALWAYS_SOFTWARE", "1");
+
+        let (child, display) = spawn_with_displayfd(command).await?;
+        self.display = Some(display);
+        self.proc = Some(child);
+        Ok(format!(":{display}"))
+    }
+
+    /// Returns the `":<n>"` display string, starting Xvfb when needed.
+    pub async fn get(&mut self) -> Result<String> {
+        if self.proc.is_none() {
+            self.spawn_xvfb().await
+        } else {
+            if self.debug {
+                if let Some(display) = self.display {
+                    println!("Using virtual display: {display}");
+                }
+            }
+            match self.display {
+                Some(display) => Ok(format!(":{display}")),
+                None => Err(CamoufoxError::CannotExecuteXvfb(
+                    "display number unavailable".into(),
+                )),
+            }
+        }
+    }
+
+    /// Terminates Xvfb and removes its lock/socket files.
+    pub fn kill(&mut self) {
+        let Some(display) = self.display else {
+            return;
+        };
+        if let Some(proc) = self.proc.as_mut() {
+            let _ = proc.start_kill();
+        }
+        let _ = std::fs::remove_file(format!("/tmp/.X{display}-lock"));
+        let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{display}"));
+    }
+
+    /// Waits for Xvfb to exit (best effort).
+    pub async fn wait(&mut self) {
+        if let Some(proc) = self.proc.as_mut() {
+            let _ = tokio::time::timeout(Duration::from_secs(5), proc.wait()).await;
+        }
+    }
+}
+
+/// Spawns `command` with a displayfd pipe on fd 3 and returns the child plus
+/// the display number it reported.
+///
+/// The write end is dup2'd onto fd 3 in the child (and the read end closed
+/// there); the parent drops its write end so EOF propagates, then reads
+/// `"<display>\n"` with a timeout. File-descriptor ownership is transferred
+/// exactly once: the pipe's [`OwnedFd`] is *moved* into the `File` — a
+/// `from_raw_fd` alias here would double-close and abort the process.
+#[cfg(target_os = "linux")]
+async fn spawn_with_displayfd(
+    mut command: tokio::process::Command,
+) -> Result<(tokio::process::Child, u32)> {
+    use std::os::unix::io::AsRawFd;
+
+    // O_CLOEXEC keeps the pipe private to this parent and its displayfd
+    // child: unrelated children spawned concurrently never inherit it.
+    let (read_fd, write_fd) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).map_err(|e| {
+        CamoufoxError::CannotExecuteXvfb(format!("could not create displayfd pipe: {e}"))
+    })?;
+
+    let write_fd_for_exec = write_fd.as_raw_fd();
+    let read_fd_for_exec = read_fd.as_raw_fd();
+    unsafe {
+        command.pre_exec(move || {
+            // Move the write end to fd 3, safe against fd-number collisions:
+            // dup() first (fresh descriptor, CLOEXEC cleared), then dup2 onto
+            // 3. A plain dup2 followed by close(read_fd) breaks when the read
+            // end happens to sit at fd 3 — the close would destroy the very
+            // descriptor the dup2 just installed.
+            let copy = nix::unistd::dup(write_fd_for_exec)?;
+            if copy != 3 {
+                nix::unistd::dup2(copy, 3)?;
+                nix::unistd::close(copy)?;
+            }
+            // Close the originals unless one of them is (or became) fd 3.
+            if read_fd_for_exec != 3 {
+                nix::unistd::close(read_fd_for_exec)?;
+            }
+            if write_fd_for_exec != 3 {
+                nix::unistd::close(write_fd_for_exec)?;
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| CamoufoxError::CannotExecuteXvfb(e.to_string()))?;
+
+    // Drop the parent's write end so EOF propagates if the child dies.
+    drop(write_fd);
+
+    // Move the read end into a File — single owner, no double close.
+    let read_file = std::fs::File::from(read_fd);
+    let mut reader = tokio::io::BufReader::new(tokio::fs::File::from_std(read_file));
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(
+        Duration::from_millis(DISPLAYFD_READ_TIMEOUT_MS),
+        reader.read_until(b'\n', &mut buf),
+    )
+    .await;
+
+    match read {
+        Ok(Ok(n)) if n > 0 => {}
+        Ok(Ok(_)) => {
+            let _ = child.start_kill();
+            return Err(CamoufoxError::CannotExecuteXvfb(
+                "child closed the displayfd pipe without reporting a display".into(),
+            ));
+        }
+        Ok(Err(e)) => {
+            let _ = child.start_kill();
+            return Err(CamoufoxError::CannotExecuteXvfb(format!(
+                "failed to read displayfd: {e}"
+            )));
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            return Err(CamoufoxError::CannotExecuteXvfb(format!(
+                "no display reported within {DISPLAYFD_READ_TIMEOUT_MS}ms"
+            )));
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buf).trim().to_string();
+    match text.parse::<u32>() {
+        Ok(display) => Ok((child, display)),
+        Err(_) => {
+            let _ = child.start_kill();
+            Err(CamoufoxError::CannotExecuteXvfb(format!(
+                "child did not report a display (got {text:?})"
+            )))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for VirtualDisplay {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn xvfb_available() -> bool {
+        std::process::Command::new("which")
+            .arg("Xvfb")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn displayfd_pipe_lifecycle_is_safe() {
+        // Exercises the exact fd plumbing of spawn_with_displayfd using `sh`
+        // instead of Xvfb: the child writes a display number to fd 3. Passes
+        // if the ownership transfer is correct (a double close aborts the
+        // process with an IO safety violation).
+        if !std::process::Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .stdout(Stdio::null())
+            .status()
+            .is_ok()
+        {
+            return;
+        }
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("printf '5\\n' >&3");
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+        let (mut child, display) = spawn_with_displayfd(command).await.unwrap();
+        assert_eq!(display, 5);
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn spawns_and_reports_display() {
+        if !xvfb_available() {
+            return; // Xvfb not installed on this host
+        }
+        let mut vd = VirtualDisplay::new(false);
+        let display = vd.get().await.unwrap();
+        assert!(display.starts_with(':'), "display format: {display}");
+        let n: u32 = display[1..].parse().unwrap();
+        assert!(std::path::Path::new(&format!("/tmp/.X11-unix/X{n}")).exists());
+
+        vd.kill();
+        vd.wait().await;
+        assert!(!std::path::Path::new(&format!("/tmp/.X11-unix/X{n}")).exists());
+        assert!(!std::path::Path::new(&format!("/tmp/.X{n}-lock")).exists());
+    }
+
+    #[tokio::test]
+    async fn get_is_idempotent() {
+        if !xvfb_available() {
+            return;
+        }
+        let mut vd = VirtualDisplay::new(false);
+        let a = vd.get().await.unwrap();
+        let b = vd.get().await.unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn concurrent_displays_are_unique() {
+        if !xvfb_available() {
+            return;
+        }
+        let mut vds: Vec<VirtualDisplay> = (0..10).map(|_| VirtualDisplay::new(false)).collect();
+        let mut displays = Vec::new();
+        for vd in &mut vds {
+            displays.push(vd.get().await.unwrap());
+        }
+        let unique: std::collections::HashSet<_> = displays.iter().collect();
+        assert_eq!(unique.len(), displays.len(), "displays must be unique");
+        for vd in &mut vds {
+            vd.kill();
+        }
+    }
+}
+
+/// Non-Linux stub: the API surface exists but always reports the platform as
+/// unsupported.
+#[cfg(not(target_os = "linux"))]
+impl VirtualDisplay {
+    /// Creates an unstarted virtual display handle.
+    pub fn new(debug: bool) -> Self {
+        let _ = debug;
+        Self {}
+    }
+
+    /// Always fails on non-Linux platforms.
+    pub async fn get(&mut self) -> Result<String> {
+        Err(CamoufoxError::VirtualDisplayNotSupported(
+            "Virtual display is only supported on Linux.".into(),
+        ))
+    }
+
+    /// No-op on non-Linux platforms.
+    pub fn kill(&mut self) {}
+
+    /// No-op on non-Linux platforms.
+    pub async fn wait(&mut self) {}
+}
