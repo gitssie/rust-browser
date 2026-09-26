@@ -1,8 +1,8 @@
 //! Local application settings stored in the same SQLite database as profiles.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +11,48 @@ use crate::storage;
 
 const GENERAL_KEY: &str = "general_proxy";
 const BROWSER_DOWNLOAD_KEY: &str = "browser_download";
+const DATA_DIRECTORIES_KEY: &str = "data_directories";
+
+/// Optional storage roots. Missing values use the program directory.
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataDirectories {
+    pub browser_root: Option<PathBuf>,
+    pub profiles_root: Option<PathBuf>,
+}
+
+impl DataDirectories {
+    pub fn load(root: &Path) -> Result<Self> {
+        let conn = storage::connection(root)?;
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                [DATA_DIRECTORIES_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .unwrap_or_else(|| Ok(Self::default()))
+    }
+
+    pub fn save(&self, root: &Path) -> Result<()> {
+        for path in [&self.browser_root, &self.profiles_root]
+            .into_iter()
+            .flatten()
+        {
+            if !path.is_absolute() {
+                bail!("数据目录必须是绝对路径：{}", path.display());
+            }
+        }
+        let conn = storage::connection(root)?;
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![DATA_DIRECTORIES_KEY, serde_json::to_string(self)?],
+        )?;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserDownloadSettings {

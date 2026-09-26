@@ -252,6 +252,10 @@ impl ProfileService {
     pub fn with_proxy(data_dir: impl AsRef<Path>, proxy: ProxySettings) -> ProfileResult<Self> {
         let paths =
             AppPaths::new(Some(data_dir.as_ref().to_path_buf())).map_err(ProfileError::Storage)?;
+        Self::with_paths(paths, proxy)
+    }
+
+    pub fn with_paths(paths: AppPaths, proxy: ProxySettings) -> ProfileResult<Self> {
         storage::open_store(paths.root()).map_err(ProfileError::Storage)?;
         let profiles_dir = paths.profiles();
         fs::create_dir_all(&profiles_dir).map_err(|error| ProfileError::Storage(error.into()))?;
@@ -266,6 +270,10 @@ impl ProfileService {
 
     pub fn data_dir(&self) -> &Path {
         self.paths.root()
+    }
+
+    pub fn paths(&self) -> &AppPaths {
+        &self.paths
     }
 
     pub fn profiles_dir(&self) -> PathBuf {
@@ -805,6 +813,7 @@ fn storage(error: impl Into<anyhow::Error>) -> ProfileError {
 mod tests {
     use super::*;
     use crate::proxy_management::{ManagedProxy, ProxyCredentials, ProxyPolicy};
+    use crate::settings::DataDirectories;
 
     fn geo() -> ProfileGeo {
         ProfileGeo {
@@ -831,6 +840,30 @@ mod tests {
             proxy,
             geo: None,
         }
+    }
+
+    #[tokio::test]
+    async fn delete_uses_trash_on_custom_profile_volume() {
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("program");
+        let external = temp.path().join("external");
+        fs::create_dir_all(&external).unwrap();
+        let external = external.canonicalize().unwrap();
+        DataDirectories {
+            profiles_root: Some(external.clone()),
+            ..Default::default()
+        }
+        .save(&program)
+        .unwrap();
+        let service = ProfileService::new(&program, "socks5://127.0.0.1:12334").unwrap();
+        let record = PersonaRecord::generate("alpha", &FingerprintRequest::default()).unwrap();
+        service.store().unwrap().save(&record).await.unwrap();
+        let data = service.profiles_dir().join("alpha");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("cookies.sqlite"), b"saved").unwrap();
+        service.delete("alpha").await.unwrap();
+        assert!(!data.exists());
+        assert_eq!(service.paths().trash(), external.join("trash"));
     }
 
     #[test]

@@ -91,10 +91,14 @@ impl DownloadControl {
 }
 
 impl BrowserManager {
-    pub fn new(root: impl AsRef<Path>) -> Self {
-        Self {
-            paths: AppPaths::for_root(root),
-        }
+    pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            paths: AppPaths::new(Some(root.as_ref().to_path_buf()))?,
+        })
+    }
+
+    pub fn with_paths(paths: AppPaths) -> Self {
+        Self { paths }
     }
 
     pub fn active_path(&self) -> PathBuf {
@@ -249,10 +253,10 @@ impl BrowserManager {
         mut progress: impl FnMut(DownloadProgress),
     ) -> Result<()> {
         control.ensure_active()?;
-        fs::create_dir_all(self.paths.root())?;
+        fs::create_dir_all(self.paths.browser_root())?;
         let staging = tempfile::Builder::new()
             .prefix("browser-download-")
-            .tempdir_in(self.paths.root())?;
+            .tempdir_in(self.paths.browser_root())?;
         let archive = staging.path().join("camoufox.zip");
         let mut builder = reqwest::Client::builder()
             .user_agent(concat!("cazer-browser/", env!("CARGO_PKG_VERSION")))
@@ -482,8 +486,8 @@ mod tests {
     fn prepared_installation_uses_its_own_root_and_checks_executable() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        let manager = BrowserManager::new(first.path());
-        let other = BrowserManager::new(second.path());
+        let manager = BrowserManager::new(first.path()).unwrap();
+        let other = BrowserManager::new(second.path()).unwrap();
         fake_version(&manager.active_path(), "0.9.1");
         fake_version(&other.active_path(), "0.9.2");
         let binary = browser_executable(&manager.active_path());
@@ -528,7 +532,7 @@ mod tests {
     #[test]
     fn switches_and_deletes_archived_versions_without_touching_active() {
         let dir = tempfile::tempdir().unwrap();
-        let manager = BrowserManager::new(dir.path());
+        let manager = BrowserManager::new(dir.path()).unwrap();
         fake_version(&manager.active_path(), "0.9.1");
         let older = CamoufoxVersion::new("0.9.0", Some("132.0".into()));
         fake_version(
@@ -547,7 +551,7 @@ mod tests {
     #[test]
     fn installing_a_new_version_archives_the_previous_one() {
         let root = tempfile::tempdir().unwrap();
-        let manager = BrowserManager::new(root.path());
+        let manager = BrowserManager::new(root.path()).unwrap();
         fake_version(&manager.active_path(), "0.9.1");
         let staging = root.path().join("staging");
         fake_version(&staging, "0.9.2");
@@ -564,7 +568,7 @@ mod tests {
     #[test]
     fn interrupted_switch_restores_previous_browser_before_launch() {
         let root = tempfile::tempdir().unwrap();
-        let manager = BrowserManager::new(root.path());
+        let manager = BrowserManager::new(root.path()).unwrap();
         fake_version(&manager.active_path(), "0.9.1");
         fs::rename(
             manager.active_path(),
@@ -579,7 +583,7 @@ mod tests {
     #[test]
     fn interrupted_switch_archives_previous_browser_after_activation() {
         let root = tempfile::tempdir().unwrap();
-        let manager = BrowserManager::new(root.path());
+        let manager = BrowserManager::new(root.path()).unwrap();
         fake_version(&manager.paths.browser_switch_previous(), "0.9.1");
         fake_version(&manager.active_path(), "0.9.2");
         let versions = manager.installed_versions().unwrap();
@@ -594,7 +598,7 @@ mod tests {
     #[test]
     fn running_browser_blocks_version_switch() {
         let root = tempfile::tempdir().unwrap();
-        let manager = BrowserManager::new(root.path());
+        let manager = BrowserManager::new(root.path()).unwrap();
         fake_version(&manager.active_path(), "0.9.1");
         let older = CamoufoxVersion::new("0.9.0", Some("132.0".into()));
         fake_version(
@@ -646,7 +650,7 @@ mod tests {
             stream.write_all(&body).unwrap();
         });
         let root = tempfile::tempdir().unwrap();
-        let manager = BrowserManager::new(root.path());
+        let manager = BrowserManager::new(root.path()).unwrap();
         let release = Release {
             version: CamoufoxVersion::new("0.9.9", Some("132.0".into())),
             url,
@@ -674,7 +678,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_before_download_preserves_current_version() {
         let root = tempfile::tempdir().unwrap();
-        let manager = BrowserManager::new(root.path());
+        let manager = BrowserManager::new(root.path()).unwrap();
         fake_version(&manager.active_path(), "0.9.1");
         let control = DownloadControl::default();
         control.cancel();
@@ -702,7 +706,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(800));
         });
         let root = tempfile::tempdir().unwrap();
-        let manager = BrowserManager::new(root.path());
+        let manager = BrowserManager::new(root.path()).unwrap();
         let control = DownloadControl::default();
         let cancel = control.clone();
         tokio::spawn(async move {

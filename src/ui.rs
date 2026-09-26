@@ -24,6 +24,7 @@ use gpui_component::{
 use rust_browser::browser_manager::{
     BrowserManager, DownloadControl, DownloadProgress, DownloadStage, InstalledVersion, Release,
 };
+use rust_browser::directory_management::{copy_storage, remove_source_storage};
 use rust_browser::geo::ProfileGeo;
 use rust_browser::launch_progress::{LaunchEvent, LaunchStage, read_events};
 use rust_browser::paths::AppPaths;
@@ -36,8 +37,9 @@ use rust_browser::proxy_management::{
     IpSwitch, ManagedProxy, ProxyCatalog, ProxyCredentials, ProxyPolicy, SwitchMethod,
 };
 use rust_browser::runtime::BrowserRuntime;
-use rust_browser::settings::{BrowserDownloadSettings, GeneralSettings};
+use rust_browser::settings::{BrowserDownloadSettings, DataDirectories, GeneralSettings};
 use rust_browser::tags::TagCatalog;
+use rust_browser::workspace_lock::WorkspaceLock;
 
 use crate::Paths;
 
@@ -131,38 +133,58 @@ enum SettingsTab {
     Data,
 }
 
+#[derive(Clone, Copy)]
+enum StorageKind {
+    Browser,
+    Profiles,
+}
+
+impl StorageKind {
+    fn names(self) -> &'static [&'static str] {
+        match self {
+            Self::Browser => &["browser", "browser-versions", "browser-switch-previous"],
+            Self::Profiles => &["profiles", "trash"],
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Browser => "浏览器文件工作目录",
+            Self::Profiles => "用户数据工作目录",
+        }
+    }
+}
+
 struct InitialSettings {
     general: GeneralSettings,
     browser_download: BrowserDownloadSettings,
+    workspace_lock: Arc<WorkspaceLock>,
 }
 
-pub fn run(paths: Paths, global_proxy: ProxySettings) -> Result<()> {
-    ui_startup_trace("enter ui::run");
+pub fn run(
+    paths: Paths,
+    global_proxy: ProxySettings,
+    workspace_lock: Arc<WorkspaceLock>,
+) -> Result<()> {
     let service = ProfileService::with_proxy(paths.root(), global_proxy.clone())?;
     let runtime = BrowserRuntime::new(paths.root());
     let tokio = tokio::runtime::Handle::current();
     let initial_settings = InitialSettings {
         general: GeneralSettings::load(paths.root())?,
         browser_download: BrowserDownloadSettings::load(paths.root())?,
+        workspace_lock,
     };
-    ui_startup_trace("before gpui_platform::application");
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
-    ui_startup_trace("before app.run");
     app.run(move |cx| {
-        ui_startup_trace("inside app.run callback");
         gpui_component::init(cx);
-        ui_startup_trace("after gpui_component::init");
         let bounds = Bounds::centered(None, size(px(1460.), px(900.)), cx);
         let mut options = TitleBar::window_options();
         options.window_bounds = Some(WindowBounds::Windowed(bounds));
         options.window_min_size = Some(size(px(1050.), px(600.)));
         options.app_id = Some("app.cazer.browser".into());
         cx.spawn(async move |cx| {
-            ui_startup_trace("before cx.open_window");
             cx.open_window(options, move |window, cx| {
-                ui_startup_trace("inside open_window callback");
                 let home = cx.new(|cx| {
-                    ui_startup_trace("before BrowserHome::new");
                     BrowserHome::new(
                         service,
                         runtime,
@@ -173,26 +195,13 @@ pub fn run(paths: Paths, global_proxy: ProxySettings) -> Result<()> {
                         cx,
                     )
                 });
-                ui_startup_trace("after BrowserHome::new");
-                cx.new(|cx| {
-                    ui_startup_trace("before Root::new");
-                    let root = Root::new(home, window, cx);
-                    ui_startup_trace("after Root::new");
-                    root
-                })
+                cx.new(|cx| Root::new(home, window, cx))
             })
             .expect("open browser manager");
-            ui_startup_trace("after cx.open_window");
         })
         .detach();
     });
     Ok(())
-}
-
-fn ui_startup_trace(stage: &str) {
-    if std::env::var_os("CAZER_UI_TRACE").is_some() {
-        eprintln!("[DEBUG-cazer-ui] {stage}");
-    }
 }
 
 struct BrowserHome {
@@ -201,6 +210,7 @@ struct BrowserHome {
     runtime: BrowserRuntime,
     tokio: tokio::runtime::Handle,
     global_proxy: ProxySettings,
+    workspace_lock: Arc<WorkspaceLock>,
     settings_tab: Option<SettingsTab>,
     general: GeneralSettings,
     general_host: Entity<InputState>,
@@ -213,6 +223,8 @@ struct BrowserHome {
     general_test: String,
     general_testing: bool,
     general_test_generation: u64,
+    storage_busy: bool,
+    storage_status: String,
     browser_download_settings: BrowserDownloadSettings,
     browser_versions: Vec<InstalledVersion>,
     browser_latest: Option<Release>,
@@ -287,7 +299,137 @@ struct BrowserHome {
 
 impl BrowserHome {
     fn browser_manager(&self) -> BrowserManager {
-        BrowserManager::new(self.service.data_dir())
+        BrowserManager::with_paths(self.paths.clone())
+    }
+
+    fn choose_storage_root(&mut self, kind: StorageKind, cx: &mut Context<Self>) {
+        if self.storage_busy {
+            return;
+        }
+        if self.busy || self.browser_busy || self.browser_checking || self.launch.is_some() {
+            self.storage_status = "请等待当前操作结束后再更改目录".into();
+            cx.notify();
+            return;
+        }
+        let selected = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(format!("选择{}", kind.label()).into()),
+        });
+        cx.spawn(async move |this, cx| match selected.await {
+            Ok(Ok(Some(mut paths))) => {
+                if let Some(path) = paths.pop() {
+                    let _ = this.update(cx, |this, cx| this.change_storage_root(kind, path, cx));
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                let _ = this.update(cx, |this, cx| {
+                    this.storage_status = format!("选择目录失败：{error}");
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = this.update(cx, |this, cx| {
+                    this.storage_status = format!("选择目录失败：{error}");
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn change_storage_root(&mut self, kind: StorageKind, target: PathBuf, cx: &mut Context<Self>) {
+        let source = match kind {
+            StorageKind::Browser => self.paths.browser_root().to_path_buf(),
+            StorageKind::Profiles => self.paths.profiles_root().to_path_buf(),
+        };
+        if source == target {
+            return;
+        }
+        self.storage_busy = true;
+        self.storage_status = format!("正在搬迁{}…", kind.label());
+        cx.notify();
+        let root = self.paths.root().to_path_buf();
+        let service = self.service.clone();
+        let runtime = self.runtime.clone();
+        let tokio = self.tokio.clone();
+        let proxy = self.global_proxy.clone();
+        let workspace_lock = self.workspace_lock.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    workspace_lock.with_exclusive(|| {
+                        let ids = tokio.block_on(service.list_ids())?;
+                        for id in ids {
+                            if tokio.block_on(runtime.is_running(&id)) {
+                                anyhow::bail!("请先关闭所有浏览器再搬迁数据目录");
+                            }
+                        }
+                        let target = target.canonicalize()?;
+                        let mut changed = DataDirectories::load(&root)?;
+                        match kind {
+                            StorageKind::Browser => {
+                                changed.browser_root = (target != root).then(|| target.clone())
+                            }
+                            StorageKind::Profiles => {
+                                changed.profiles_root = (target != root).then(|| target.clone())
+                            }
+                        }
+                        let next_paths = AppPaths::with_directories(root.clone(), changed.clone())?;
+                        copy_storage(&source, &target, kind.names())?;
+                        let next = match ProfileService::with_paths(next_paths, proxy) {
+                            Ok(next) => next,
+                            Err(error) => {
+                                if let Err(cleanup) =
+                                    remove_source_storage(&target, &source, kind.names())
+                                {
+                                    anyhow::bail!(
+                                        "目录校验失败：{error}；目标目录清理失败：{cleanup}"
+                                    );
+                                }
+                                return Err(error.into());
+                            }
+                        };
+                        if let Err(error) = changed.save(&root) {
+                            if let Err(cleanup) =
+                                remove_source_storage(&target, &source, kind.names())
+                            {
+                                anyhow::bail!(
+                                    "保存目录设置失败：{error}；目标目录清理失败：{cleanup}"
+                                );
+                            }
+                            return Err(error);
+                        }
+                        let paths = next.paths().clone();
+                        let cleanup = remove_source_storage(&source, &target, kind.names());
+                        Ok((paths, next, cleanup))
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.storage_busy = false;
+                match result {
+                    Ok((paths, service, cleanup)) => {
+                        this.paths = paths;
+                        this.service = service;
+                        this.refresh_browser_versions();
+                        this.reload(cx);
+                        this.storage_status = match cleanup {
+                            Ok(()) => format!("{}已搬迁", kind.label()),
+                            Err(error) => format!("新目录已启用，但旧目录清理失败：{error}"),
+                        };
+                    }
+                    Err(error) => {
+                        this.storage_status = format!("目录搬迁失败：{error}");
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn refresh_browser_versions(&mut self) {
@@ -854,6 +996,7 @@ impl BrowserHome {
         let InitialSettings {
             general,
             browser_download: browser_download_settings,
+            workspace_lock,
         } = initial_settings;
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索名称或 ID"));
         let form_id = cx.new(|cx| InputState::new(window, cx).placeholder("例如 vinted-fr-01"));
@@ -962,8 +1105,8 @@ impl BrowserHome {
         let managed = ProxyCatalog::new(service.data_dir())
             .list()
             .unwrap_or_default();
-        let paths = AppPaths::for_root(service.data_dir());
-        let browser_manager = BrowserManager::new(service.data_dir());
+        let paths = service.paths().clone();
+        let browser_manager = BrowserManager::with_paths(paths.clone());
         let (browser_versions, browser_status) = match browser_manager.installed_versions() {
             Ok(versions) => (versions, String::new()),
             Err(error) => (Vec::new(), format!("读取已安装版本失败：{error}")),
@@ -974,6 +1117,7 @@ impl BrowserHome {
             runtime,
             tokio,
             global_proxy,
+            workspace_lock,
             settings_tab: None,
             general,
             general_host,
@@ -986,6 +1130,8 @@ impl BrowserHome {
             general_test: String::new(),
             general_testing: false,
             general_test_generation: 0,
+            storage_busy: false,
+            storage_status: String::new(),
             browser_download_settings,
             browser_versions,
             browser_latest: None,
@@ -1402,7 +1548,6 @@ impl BrowserHome {
     }
 
     fn show_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        ui_startup_trace("new profile clicked");
         self.dialog = Dialog::Create;
         self.form_custom_proxy = false;
         self.form_os = ProfileOs::Windows;
@@ -1948,6 +2093,61 @@ impl BrowserHome {
                                     ),
                             ),
                     ),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .p_5()
+                    .gap_4()
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .rounded_md()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_semibold()
+                            .text_color(rgb(INK))
+                            .child("数据目录"),
+                    )
+                    .child(storage_directory_row(
+                        "程序目录（SQLite 与设置）",
+                        self.paths.root().to_path_buf(),
+                        None,
+                        self.storage_busy,
+                        cx,
+                    ))
+                    .child(storage_directory_row(
+                        "浏览器文件工作目录",
+                        self.paths.browser_root().to_path_buf(),
+                        Some(StorageKind::Browser),
+                        self.storage_busy,
+                        cx,
+                    ))
+                    .child(storage_directory_row(
+                        "用户数据工作目录",
+                        self.paths.profiles_root().to_path_buf(),
+                        Some(StorageKind::Profiles),
+                        self.storage_busy,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child("所选位置分别存放 browser/、browser-versions/ 和 profiles/。"),
+                    )
+                    .when(!self.storage_status.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(if self.storage_status.contains("失败") {
+                                    RED
+                                } else {
+                                    GREEN
+                                }))
+                                .child(self.storage_status.clone()),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -3142,7 +3342,6 @@ impl BrowserHome {
                     .icon(IconName::Settings)
                     .label("全局设置")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        ui_startup_trace("settings clicked");
                         this.settings_tab = Some(SettingsTab::General);
                         this.popup = None;
                         cx.notify();
@@ -4162,20 +4361,10 @@ impl BrowserHome {
 
 impl Render for BrowserHome {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        static RENDER_TRACE_COUNT: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        let render_number =
-            RENDER_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if render_number <= 10 || render_number % 50 == 0 {
-            ui_startup_trace(&format!(
-                "BrowserHome::render #{render_number} settings={} dialog={}",
-                self.settings_tab.is_some(),
-                !matches!(self.dialog, Dialog::None)
-            ));
-        }
         if self.settings_tab.is_some() {
             return div()
                 .size_full()
+                .relative()
                 .bg(rgb(0xffffff))
                 .child(
                     v_flex()
@@ -4183,6 +4372,25 @@ impl Render for BrowserHome {
                         .child(self.render_header(cx))
                         .child(self.render_settings(window, cx)),
                 )
+                .when(self.storage_busy, |page| {
+                    page.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .bg(hsla(0., 0., 0., 0.28))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .p_5()
+                                    .rounded_md()
+                                    .bg(rgb(0xffffff))
+                                    .text_color(rgb(INK))
+                                    .child(self.storage_status.clone()),
+                            ),
+                    )
+                })
                 .into_any_element();
         }
         let rows = if self.rows.is_empty() {
@@ -4261,6 +4469,45 @@ fn settings_field(label: &'static str, input: &Entity<InputState>) -> AnyElement
         .gap_2()
         .child(div().w(px(90.)).text_sm().text_color(rgb(INK)).child(label))
         .child(div().flex_1().child(Input::new(input)))
+        .into_any_element()
+}
+
+fn storage_directory_row(
+    label: &'static str,
+    root: PathBuf,
+    kind: Option<StorageKind>,
+    busy: bool,
+    cx: &mut Context<BrowserHome>,
+) -> AnyElement {
+    h_flex()
+        .items_center()
+        .gap_3()
+        .child(
+            div()
+                .w(px(170.))
+                .text_sm()
+                .text_color(rgb(INK))
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .text_color(rgb(MUTED))
+                .child(root.display().to_string()),
+        )
+        .when_some(kind, |row, kind| {
+            row.child(
+                Button::new(format!("change-directory-{}", kind.label()))
+                    .outline()
+                    .label("选择目录")
+                    .disabled(busy)
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.choose_storage_root(kind, cx)),
+                    ),
+            )
+        })
         .into_any_element()
 }
 

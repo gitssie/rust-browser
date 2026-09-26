@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -33,6 +34,7 @@ use rust_browser::proxy_management::{
 use rust_browser::runtime::BrowserRuntime;
 use rust_browser::settings::{BrowserDownloadSettings, GeneralSettings};
 use rust_browser::storage;
+use rust_browser::workspace_lock::WorkspaceLock;
 
 mod ui;
 
@@ -448,7 +450,7 @@ async fn open(
     })
     .await?;
     progress.stage(LaunchStage::StartBrowser, None)?;
-    let browser_manager = BrowserManager::new(paths.root());
+    let browser_manager = BrowserManager::with_paths(paths.clone());
     let _browser_guard = browser_manager.runtime_guard()?;
     let installation = browser_manager.prepare_active()?;
     println!(
@@ -801,7 +803,7 @@ async fn scan(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Result<(
         };
     let (saved_geo, current_geo) = checked_location(&persona, id, &proxy).await?;
     let expected_ip = current_geo.ip;
-    let browser_manager = BrowserManager::new(paths.root());
+    let browser_manager = BrowserManager::with_paths(paths.clone());
     let _browser_guard = browser_manager.runtime_guard()?;
     let installation = browser_manager.prepare_active()?;
     let options =
@@ -914,7 +916,9 @@ async fn scan(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Result<(
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let paths = Paths::new(cli.data_dir)?;
+    let program_root = Paths::program_root(cli.data_dir.as_deref())?;
+    let workspace_lock = Arc::new(WorkspaceLock::shared(&program_root)?);
+    let paths = Paths::new(Some(program_root))?;
     storage::open_store(paths.root())?;
     let global_proxy = if matches!(&cli.command, Command::Ui) {
         GeneralSettings::load(paths.root())?.proxy()?
@@ -926,7 +930,7 @@ async fn run(cli: Cli) -> Result<()> {
     };
     match cli.command {
         Command::Fetch => {
-            let manager = BrowserManager::new(paths.root());
+            let manager = BrowserManager::with_paths(paths.clone());
             let proxy = if BrowserDownloadSettings::load(paths.root())?.use_global_proxy {
                 Some(GeneralSettings::load(paths.root())?.proxy()?)
             } else {
@@ -1020,6 +1024,8 @@ async fn run(cli: Cli) -> Result<()> {
             }
             let details = json!({
                 "data_dir": paths.root(),
+                "browser_root": paths.browser_root(),
+                "profiles_root": paths.profiles_root(),
                 "browser_install": paths.browser(),
                 "persona_store": paths.database(),
                 "browser_data": id.map(|id| paths.profile(&id)),
@@ -1037,7 +1043,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Delete { id, yes } => delete(&paths, &id, yes, &global_proxy).await?,
         Command::Doctor => {
             println!("Data directory: {}", paths.root().display());
-            let browser_manager = BrowserManager::new(paths.root());
+            let browser_manager = BrowserManager::with_paths(paths.clone());
             println!(
                 "Browser directory: {}",
                 browser_manager.active_path().display()
@@ -1054,7 +1060,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             proxy_status?;
         }
-        Command::Ui => ui::run(paths, global_proxy)?,
+        Command::Ui => ui::run(paths, global_proxy, workspace_lock)?,
         Command::Proxy { action } => {
             let catalog = ProxyCatalog::new(paths.root());
             match action {

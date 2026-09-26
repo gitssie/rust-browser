@@ -196,15 +196,21 @@ return typed `ProfileError` variants for invalid input, missing or duplicate
 profiles, profiles in use, proxy/GeoIP failures, and storage failures.
 BrowserScan is not part of this API's profile model.
 
-Data lives in the platform application data directory under `rust-browser`:
+Data defaults to the executable's directory:
 `browser.sqlite` holds profiles, sessions, settings, tags, and managed proxies;
 `profiles/<id>/` holds browser user data; `browser/` is the active Camoufox
-installation; and `browser-versions/` holds inactive installed versions.
-`locks/`, `logs/`, `artifacts/`, and `trash/` contain local coordination files,
-launch logs, development scan output, and profile deletion staging. Runtime
+installation; and `browser-versions/` holds inactive installed versions. The
+General settings page can move the browser installation and profile data to
+separate storage roots (`browser/` and `browser-versions/` under the browser
+root; `profiles/` and `trash/` under the profile root), while SQLite stays
+beside the program.
+The program directory must be writable by the current user.
+`locks/`, `logs/`, and `artifacts/` remain in the program directory; `trash/`
+stays beside `profiles/` for profile deletion staging. Runtime
 sockets remain in the OS temporary directory. All application paths are defined
-in `src/paths.rs`; CLI, GPUI, and library code share this layout. Override the
-root with `--data-dir PATH` or `RUST_BROWSER_DATA_DIR=PATH`. The Rust browser
+in `src/paths.rs`; CLI, GPUI, and library code share this layout. Development
+and scripted runs can override the program root with `--data-dir PATH` or
+`RUST_BROWSER_DATA_DIR=PATH`. The Rust browser
 installation is separate from the Python Camoufox installation.
 
 This CLI does not import the Python project's existing profiles. The scanner
