@@ -9,6 +9,9 @@ pub mod proxy;
 pub mod proxy_management;
 #[cfg(unix)]
 pub mod runtime;
+#[cfg(windows)]
+#[path = "runtime_windows.rs"]
+pub mod runtime;
 pub mod settings;
 pub mod storage;
 pub mod tags;

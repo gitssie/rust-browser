@@ -17,7 +17,6 @@ use crate::launch_progress::LaunchStage;
 use crate::paths::AppPaths;
 use crate::profiles::{ProfileQuery, ProfileService, ProxyChoice};
 use crate::proxy::ProxySettings;
-#[cfg(unix)]
 use crate::runtime::BrowserRuntime;
 use crate::storage;
 
@@ -214,10 +213,7 @@ impl ProxyLaunchGuard {
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(Self(file)),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && Instant::now() < deadline =>
-                {
+                Err(error) if lock_contended(&error) && Instant::now() < deadline => {
                     sleep(Duration::from_millis(100)).await;
                 }
                 Err(error) => return Err(error).context("could not acquire proxy launch lock"),
@@ -232,7 +228,6 @@ impl Drop for ProxyLaunchGuard {
     }
 }
 
-#[cfg(unix)]
 pub async fn prepare_browser_launch(
     root: &Path,
     profile_id: &str,
@@ -242,7 +237,6 @@ pub async fn prepare_browser_launch(
     prepare_browser_launch_with_progress(root, profile_id, proxy, global_proxy, |_, _| Ok(())).await
 }
 
-#[cfg(unix)]
 pub async fn prepare_browser_launch_with_progress(
     root: &Path,
     profile_id: &str,
@@ -304,7 +298,6 @@ pub async fn prepare_browser_launch_with_progress(
     Ok(Some(guard))
 }
 
-#[cfg(unix)]
 async fn enforce_policy(
     root: &Path,
     record: &ManagedProxy,
@@ -355,12 +348,10 @@ async fn enforce_policy(
     }
 }
 
-#[cfg(unix)]
 async fn profile_is_active(root: &Path, id: &str, runtime: &BrowserRuntime) -> Result<bool> {
     Ok(runtime.is_running(id).await || !profile_lock_released(root, id)?)
 }
 
-#[cfg(unix)]
 fn profile_lock_released(root: &Path, id: &str) -> Result<bool> {
     let path = AppPaths::for_root(root).profile_lock(id);
     let file = match OpenOptions::new().read(true).write(true).open(&path) {
@@ -373,9 +364,13 @@ fn profile_lock_released(root: &Path, id: &str) -> Result<bool> {
             file.unlock()?;
             Ok(true)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) if lock_contended(&error) => Ok(false),
         Err(error) => Err(error).with_context(|| format!("check profile lock for {id}")),
     }
+}
+
+fn lock_contended(error: &std::io::Error) -> bool {
+    error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
 pub async fn switch_ip(
@@ -551,7 +546,6 @@ mod tests {
         assert!(bad.validate().is_err());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn held_profile_lock_counts_as_active_without_control_socket() {
         let dir = tempfile::tempdir().unwrap();
@@ -579,7 +573,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn close_previous_policy_waits_for_browser_exit() {
         let dir = tempfile::tempdir().unwrap();

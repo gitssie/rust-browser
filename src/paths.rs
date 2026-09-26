@@ -129,6 +129,13 @@ impl AppPaths {
         self.runtime_sockets()
             .join(format!("{:016x}.sock", hasher.finish()))
     }
+    #[cfg(windows)]
+    pub fn runtime_pipe(&self, id: &str) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.root.hash(&mut hasher);
+        id.hash(&mut hasher);
+        format!(r"\\.\pipe\cazer-browser-{:016x}", hasher.finish())
+    }
 }
 
 #[cfg(test)]
