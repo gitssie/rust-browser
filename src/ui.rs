@@ -3042,18 +3042,6 @@ impl BrowserHome {
             .gap_3()
             .bg(rgb(0xffffff))
             .child(div().flex_1())
-            .child(
-                Button::new("open-settings")
-                    .ghost()
-                    .icon(IconName::Settings)
-                    .label("全局设置")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        ui_startup_trace("settings clicked");
-                        this.settings_tab = Some(SettingsTab::General);
-                        this.popup = None;
-                        cx.notify();
-                    })),
-            )
             .child(div().w(px(270.)).child(
                 Input::new(&self.search).prefix(Icon::new(IconName::Search).text_color(rgb(MUTED))),
             ))
@@ -3145,6 +3133,18 @@ impl BrowserHome {
                     .disabled(!can_close_all)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.dialog = Dialog::CloseAll;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("open-settings")
+                    .outline()
+                    .icon(IconName::Settings)
+                    .label("全局设置")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        ui_startup_trace("settings clicked");
+                        this.settings_tab = Some(SettingsTab::General);
+                        this.popup = None;
                         cx.notify();
                     })),
             )
