@@ -1672,6 +1672,21 @@ impl BrowserHome {
         cx.notify();
     }
 
+    fn select_form_managed_proxy(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.form_custom_proxy = true;
+        self.form_proxy
+            .update(cx, |input, cx| input.set_value(url, window, cx));
+        if matches!(self.dialog, Dialog::Create) {
+            self.detect_geo(cx);
+        }
+        cx.notify();
+    }
+
     fn fill_geo_fields(&mut self, geo: &ProfileGeo, window: &mut Window, cx: &mut Context<Self>) {
         for (input, value) in [
             (&self.form_country_code, geo.country_code.clone()),
@@ -3976,6 +3991,7 @@ impl BrowserHome {
             } else {
                 div().into_any_element()
             })
+            .child(self.render_form_managed_proxies(cx))
             .child(
                 h_flex()
                     .items_center()
@@ -4021,8 +4037,41 @@ impl BrowserHome {
                 div()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child("创建时固定地理身份；国家名称与代码、地区和时区须与代理出口一致。"),
+                    .child("创建时固定地理身份；国家名称与代码、时区须与代理出口一致。"),
             )
+            .into_any_element()
+    }
+
+    fn render_form_managed_proxies(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.managed.is_empty() {
+            return div().into_any_element();
+        }
+        let selected_url = self.form_proxy.read(cx).value().trim().to_string();
+        let mut choices = v_flex().gap_1().max_h(px(136.)).overflow_y_scrollbar();
+        for record in &self.managed {
+            let url = record.url.clone();
+            let selected = self.form_custom_proxy && selected_url == url;
+            choices = choices.child(
+                Button::new(format!("form-managed-{}", record.id))
+                    .w_full()
+                    .small()
+                    .when(selected, |button| button.primary())
+                    .when(!selected, |button| button.outline())
+                    .label(format!("{} · {}", record.name, record.url))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_form_managed_proxy(&url, window, cx)
+                    })),
+            );
+        }
+        v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("从代理管理中选择"),
+            )
+            .child(choices)
             .into_any_element()
     }
 
@@ -4076,6 +4125,7 @@ impl BrowserHome {
                 } else {
                     div().into_any_element()
                 })
+                .child(self.render_form_managed_proxies(cx))
                 .child(
                     div()
                         .text_xs()
