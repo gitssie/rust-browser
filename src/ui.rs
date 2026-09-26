@@ -137,6 +137,7 @@ struct InitialSettings {
 }
 
 pub fn run(paths: Paths, global_proxy: ProxySettings) -> Result<()> {
+    ui_startup_trace("enter ui::run");
     let service = ProfileService::with_proxy(paths.root(), global_proxy.clone())?;
     let runtime = BrowserRuntime::new(paths.root());
     let tokio = tokio::runtime::Handle::current();
@@ -144,17 +145,24 @@ pub fn run(paths: Paths, global_proxy: ProxySettings) -> Result<()> {
         general: GeneralSettings::load(paths.root())?,
         browser_download: BrowserDownloadSettings::load(paths.root())?,
     };
+    ui_startup_trace("before gpui_platform::application");
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    ui_startup_trace("before app.run");
     app.run(move |cx| {
+        ui_startup_trace("inside app.run callback");
         gpui_component::init(cx);
+        ui_startup_trace("after gpui_component::init");
         let bounds = Bounds::centered(None, size(px(1460.), px(900.)), cx);
         let mut options = TitleBar::window_options();
         options.window_bounds = Some(WindowBounds::Windowed(bounds));
         options.window_min_size = Some(size(px(1050.), px(600.)));
         options.app_id = Some("app.cazer.browser".into());
         cx.spawn(async move |cx| {
+            ui_startup_trace("before cx.open_window");
             cx.open_window(options, move |window, cx| {
+                ui_startup_trace("inside open_window callback");
                 let home = cx.new(|cx| {
+                    ui_startup_trace("before BrowserHome::new");
                     BrowserHome::new(
                         service,
                         runtime,
@@ -165,13 +173,26 @@ pub fn run(paths: Paths, global_proxy: ProxySettings) -> Result<()> {
                         cx,
                     )
                 });
-                cx.new(|cx| Root::new(home, window, cx))
+                ui_startup_trace("after BrowserHome::new");
+                cx.new(|cx| {
+                    ui_startup_trace("before Root::new");
+                    let root = Root::new(home, window, cx);
+                    ui_startup_trace("after Root::new");
+                    root
+                })
             })
             .expect("open browser manager");
+            ui_startup_trace("after cx.open_window");
         })
         .detach();
     });
     Ok(())
+}
+
+fn ui_startup_trace(stage: &str) {
+    if std::env::var_os("CAZER_UI_TRACE").is_some() {
+        eprintln!("[DEBUG-cazer-ui] {stage}");
+    }
 }
 
 struct BrowserHome {
@@ -4140,6 +4161,11 @@ impl BrowserHome {
 
 impl Render for BrowserHome {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        static RENDER_TRACE_COUNT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        if RENDER_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+            ui_startup_trace("BrowserHome::render");
+        }
         if self.settings_tab.is_some() {
             return div()
                 .size_full()
