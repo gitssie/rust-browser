@@ -1402,6 +1402,7 @@ impl BrowserHome {
     }
 
     fn show_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        ui_startup_trace("new profile clicked");
         self.dialog = Dialog::Create;
         self.form_custom_proxy = false;
         self.form_os = ProfileOs::Windows;
@@ -1769,6 +1770,7 @@ impl BrowserHome {
                             .icon(IconName::Settings)
                             .label("全局设置")
                             .on_click(cx.listener(|this, _, _, cx| {
+                                ui_startup_trace("settings clicked");
                                 this.settings_tab = Some(SettingsTab::General);
                                 this.popup = None;
                                 cx.notify();
@@ -4163,8 +4165,14 @@ impl Render for BrowserHome {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         static RENDER_TRACE_COUNT: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
-        if RENDER_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
-            ui_startup_trace("BrowserHome::render");
+        let render_number =
+            RENDER_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if render_number <= 10 || render_number % 50 == 0 {
+            ui_startup_trace(&format!(
+                "BrowserHome::render #{render_number} settings={} dialog={}",
+                self.settings_tab.is_some(),
+                !matches!(self.dialog, Dialog::None)
+            ));
         }
         if self.settings_tab.is_some() {
             return div()
