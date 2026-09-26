@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use camoufox_core::error::{CamoufoxError, Result};
+use camoufox_core::fingerprint::determine_ua_os;
 use serde_json::Value;
 
 use crate::builder::{prepare, HeadlessMode, LaunchOptions, PreparedLaunch};
@@ -121,31 +122,71 @@ pub async fn launch(options: &LaunchOptions) -> Result<LaunchedBrowser> {
 
     // Authenticated proxy without a driver: provision the auth extension.
     let mut options = options;
+    let mut auth_extension = None;
     if let Some(proxy) = options.proxy.clone() {
         if proxy.username.is_some()
             || proxy.password.is_some()
             || crate::proxyauth::server_has_credentials(&proxy.server)
         {
-            let extension = crate::proxyauth::provision(proxy)?;
+            let extension = if let Some(install_root) = options.install_root.as_deref() {
+                crate::proxyauth::provision_at(proxy, install_root)?
+            } else {
+                crate::proxyauth::provision(proxy)?
+            };
+            auth_extension = Some(extension.to_string_lossy().into_owned());
             options
                 .addons
                 .push(extension.to_string_lossy().into_owned());
         }
     }
 
-    let prepared = prepare(&options).await?;
+    let mut prepared = prepare(&options).await?;
+    // A pinned launch bypasses the builder. Keep its fingerprint unchanged,
+    // but add the current proxy-auth extension to this process's config.
+    if options.prepared_override.is_some() {
+        if let Some(extension) = auth_extension {
+            let addons = prepared
+                .config
+                .entry("addons")
+                .or_insert_with(|| Value::Array(Vec::new()));
+            let Value::Array(addons) = addons else {
+                return Err(CamoufoxError::InvalidPropertyType("addons must be an array".into()));
+            };
+            addons.retain(|addon| !addon.as_str().is_some_and(|path| path.contains("proxy-auth-")));
+            addons.push(Value::String(extension));
+            let user_agent = prepared
+                .config
+                .get("navigator.userAgent")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CamoufoxError::UnknownProperty("missing user agent".into()))?;
+            let target_os = determine_ua_os(user_agent)?;
+            prepared.env.retain(|key, _| !key.starts_with("CAMOU_CONFIG_"));
+            prepared.env.extend(camoufox_core::config::get_env_vars(
+                &prepared.config,
+                target_os,
+                options.install_root.as_deref(),
+            )?);
+        }
+    }
 
     let profile_dir = resolve_profile_dir(options.persistent_profile.as_deref())?;
     materialize_user_js(&profile_dir, &prepared.firefox_user_prefs)?;
 
     // Build the command line.
     let mut args: Vec<String> = Vec::new();
+    args.push("-no-remote".into());
+    if cfg!(windows) {
+        args.push("-wait-for-browser".into());
+    }
     args.push("--profile".into());
     args.push(profile_dir.to_string_lossy().into_owned());
     if options.headless == HeadlessMode::On {
         args.push("--headless".into());
     }
     args.extend(prepared.args.iter().cloned());
+    if options.prepared_override.is_some() {
+        args.extend(options.args.iter().cloned());
+    }
     if let Some(proxy) = &prepared.proxy {
         args.push("--proxy-server".into());
         // Credentials embedded in the URL are ignored by Firefox and handled
@@ -158,7 +199,8 @@ pub async fn launch(options: &LaunchOptions) -> Result<LaunchedBrowser> {
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
     for (key, value) in &prepared.env {
         command.env(key, value);
     }

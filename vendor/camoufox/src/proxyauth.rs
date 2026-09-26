@@ -95,6 +95,11 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// Credentials from `ProxyConfig.username`/`password` win over credentials
 /// embedded in the server URL.
 pub fn provision(proxy: ProxyConfig) -> Result<PathBuf> {
+    provision_at(proxy, &camoufox_pkgman::install_dir())
+}
+
+/// Provisions the extension beside a caller-managed browser installation.
+pub fn provision_at(proxy: ProxyConfig, install_root: &Path) -> Result<PathBuf> {
     let parsed = parse(&proxy.server)?;
     let (username, password) = match (proxy.username, proxy.password) {
         (Some(username), Some(password)) => (username, password),
@@ -113,7 +118,7 @@ pub fn provision(proxy: ProxyConfig) -> Result<PathBuf> {
         "{}|{}|{}|{}|{}",
         parsed.proxy_type, parsed.host, parsed.port, username, password
     );
-    let dir = camoufox_pkgman::install_dir()
+    let dir = install_root
         .join("addons")
         .join(format!("proxy-auth-{:016x}", fnv1a(fingerprint.as_bytes())));
 

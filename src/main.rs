@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use camoufox::builder::{HeadlessMode, LaunchOptions, PreparedLaunch, ProxyConfig, prepare};
+use camoufox::launch;
 use camoufox_core::config::{WINDOW_DIM_KEYS, get_env_vars};
 use camoufox_core::fingerprint::determine_ua_os;
 use camoufox_core::os::SupportedOs;
@@ -455,20 +456,21 @@ async fn open(
         proxy.browser_url(),
         targets.join(", ")
     );
-    let options =
+    let mut options =
         pinned_launch_options(paths, id, &mut persona, &saved_geo, &proxy, &installation).await?;
+    options.args = targets;
     let runtime_listener = BrowserRuntime::new(paths.root()).bind(id).await?;
-    let mut browser = launch_with_juggler(&options).await?;
+    let mut browser = launch(&options).await?;
     drop(proxy_guard);
     let run = tokio::select! {
         result = async {
-            for target in &targets {
-                let page = browser.new_page().await?;
-                page.goto(target).await?;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Some(status) = browser.child.try_wait()? {
+                bail!("browser exited during startup: {status}");
             }
             progress.emit(LaunchEvent::Ready)?;
-            println!("Browser PID: {:?}. Close the browser to exit.", browser.child.id());
-            let status = browser.child.wait().await?;
+            println!("Browser PID: {:?}. Close the browser to exit.", browser.id());
+            let status = browser.wait().await?;
             println!("Browser exited: {status}");
             Ok::<_, anyhow::Error>(())
         } => result,
@@ -483,8 +485,8 @@ async fn open(
             Ok(())
         },
     };
-    if run.is_err() || browser.child.try_wait()?.is_none() {
-        close_browser(&mut browser).await?;
+    if browser.child.try_wait()?.is_none() {
+        browser.kill().await?;
     }
     run
 }
@@ -556,8 +558,7 @@ fn launch_options(
         ),
         ..Default::default()
     };
-    // Apply proxy prefs before Firefox's startup networking; Juggler then
-    // configures the same proxy through its native protocol for page traffic.
+    // Apply proxy prefs before Firefox's startup networking.
     proxy.apply_firefox_prefs(&mut options.firefox_user_prefs);
     // Camoufox 152 declares canvas:seed, but Firefox's baseline protection
     // still adds a fresh per-process image-export salt. Disable that layer so
