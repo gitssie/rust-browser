@@ -93,12 +93,30 @@ fn common_args(
     headless: bool,
     extra_args: &[String],
 ) -> Vec<String> {
+    common_args_for_platform(prepared, profile_dir, headless, extra_args, cfg!(windows))
+}
+
+fn common_args_for_platform(
+    prepared: &PreparedLaunch,
+    profile_dir: &std::path::Path,
+    headless: bool,
+    extra_args: &[String],
+    windows: bool,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-no-remote".into(),
+    ];
+    if windows {
+        // Firefox's Windows launcher can hand off to a second process and
+        // exit successfully before the Juggler pipe is initialized. Keep
+        // the launched process attached to its browser lifetime.
+        args.extend(["-wait-for-browser".into(), "-foreground".into()]);
+    }
+    args.extend([
         "--profile".into(),
         profile_dir.to_string_lossy().into_owned(),
         "-juggler-pipe".into(),
-    ];
+    ]);
     if headless {
         args.push("--headless".into());
     }
@@ -561,6 +579,29 @@ async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(stderr: R, output: Startu
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_keeps_the_launcher_attached_to_the_browser() {
+        let prepared = PreparedLaunch {
+            executable_path: "camoufox.exe".into(),
+            env: Default::default(),
+            firefox_user_prefs: Default::default(),
+            args: Vec::new(),
+            proxy: None,
+            proxy_bypass: None,
+            spoofs_window_dimensions: false,
+            config: Default::default(),
+        };
+        let args = common_args_for_platform(
+            &prepared,
+            std::path::Path::new("profile"),
+            false,
+            &[],
+            true,
+        );
+        assert_eq!(&args[0..3], ["-no-remote", "-wait-for-browser", "-foreground"]);
+        assert!(args.windows(2).any(|pair| pair == ["--profile", "profile"]));
+    }
 
     #[tokio::test]
     async fn startup_failure_includes_browser_stderr() {

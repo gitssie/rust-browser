@@ -40,7 +40,7 @@ impl AppPaths {
                 .to_path_buf(),
         };
         fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
-        root.canonicalize().map_err(Into::into)
+        dunce::canonicalize(root).map_err(Into::into)
     }
 
     /// Resolve the program directory and its configured storage locations.
@@ -189,12 +189,31 @@ fn resolve_storage_root(program_root: &Path, configured: Option<PathBuf>) -> Res
     if !path.is_dir() {
         anyhow::bail!("数据目录不存在：{}", path.display());
     }
-    path.canonicalize().map_err(Into::into)
+    dunce::canonicalize(path).map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_are_not_verbatim() {
+        let program = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = AppPaths::program_root(Some(program.path())).unwrap();
+        assert!(!root.to_string_lossy().starts_with(r"\\?\"));
+        let paths = AppPaths::with_directories(
+            root,
+            DataDirectories {
+                browser_root: Some(storage.path().to_path_buf()),
+                profiles_root: None,
+            },
+        )
+        .unwrap();
+        assert!(!paths.browser().to_string_lossy().starts_with(r"\\?\"));
+        assert!(!paths.profile("test").to_string_lossy().starts_with(r"\\?\"));
+    }
 
     #[test]
     fn established_layout_is_stable() {
@@ -252,8 +271,8 @@ mod tests {
         let profiles = temp.path().join("profile-files");
         fs::create_dir_all(&browser).unwrap();
         fs::create_dir_all(&profiles).unwrap();
-        let browser = browser.canonicalize().unwrap();
-        let profiles = profiles.canonicalize().unwrap();
+        let browser = dunce::canonicalize(browser).unwrap();
+        let profiles = dunce::canonicalize(profiles).unwrap();
         DataDirectories {
             browser_root: Some(browser.clone()),
             profiles_root: Some(profiles.clone()),
@@ -263,7 +282,7 @@ mod tests {
         let paths = AppPaths::new(Some(root.clone())).unwrap();
         assert_eq!(
             paths.database(),
-            root.canonicalize().unwrap().join("browser.sqlite")
+            dunce::canonicalize(&root).unwrap().join("browser.sqlite")
         );
         assert_eq!(paths.browser(), browser.join("browser"));
         assert_eq!(paths.browser_versions(), browser.join("browser-versions"));
@@ -283,7 +302,7 @@ mod tests {
     #[test]
     fn configured_roots_cannot_overlap_managed_data() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
         let inside_browser = root.join("browser/profile-storage");
         fs::create_dir_all(&inside_browser).unwrap();
         assert!(

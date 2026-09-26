@@ -848,7 +848,7 @@ mod tests {
         let program = temp.path().join("program");
         let external = temp.path().join("external");
         fs::create_dir_all(&external).unwrap();
-        let external = external.canonicalize().unwrap();
+        let external = dunce::canonicalize(external).unwrap();
         DataDirectories {
             profiles_root: Some(external.clone()),
             ..Default::default()

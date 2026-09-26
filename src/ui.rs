@@ -387,7 +387,7 @@ impl BrowserHome {
                                 anyhow::bail!("请先关闭所有浏览器再搬迁数据目录");
                             }
                         }
-                        let target = target.canonicalize()?;
+                        let target = dunce::canonicalize(target)?;
                         let mut changed = DataDirectories::load(&root)?;
                         match kind {
                             StorageKind::Browser => {

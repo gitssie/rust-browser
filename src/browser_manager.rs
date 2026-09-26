@@ -194,7 +194,7 @@ impl BrowserManager {
         Ok(ActiveInstallation {
             root,
             version,
-            executable_path: executable_path.canonicalize()?,
+            executable_path: dunce::canonicalize(executable_path)?,
         })
     }
 
@@ -504,7 +504,10 @@ mod tests {
         }
         let installation = manager.prepare_active().unwrap();
         assert_eq!(installation.version.full_string(), "132.0-0.9.1");
-        assert_eq!(installation.executable_path, binary.canonicalize().unwrap());
+        assert_eq!(
+            installation.executable_path,
+            dunce::canonicalize(binary).unwrap()
+        );
         assert_ne!(
             installation.version,
             other.active_version().unwrap().unwrap()

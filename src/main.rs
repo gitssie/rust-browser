@@ -590,11 +590,13 @@ async fn pinned_launch_options(
         }
         let mut prepared: PreparedLaunch =
             serde_json::from_value(value.clone()).context("saved launch identity is invalid")?;
-        if prepared.executable_path != *options.executable_path.as_ref().unwrap() {
+        let saved_executable = dunce::canonicalize(&prepared.executable_path)?;
+        if saved_executable != *options.executable_path.as_ref().unwrap() {
             bail!(
                 "browser installation moved; restore the original browser installation for this pinned identity"
             );
         }
+        prepared.executable_path = saved_executable;
         prepared.proxy = Some(proxy.browser_url());
         proxy.apply_firefox_prefs(&mut prepared.firefox_user_prefs);
         options.prepared_override = Some(prepared);

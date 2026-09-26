@@ -6205,6 +6205,7 @@ dependencies = [
  "camoufox-store",
  "chrono",
  "clap",
+ "dunce",
  "env_logger",
  "fs2",
  "gpui",

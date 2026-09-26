@@ -11,8 +11,8 @@ use anyhow::{Context, Result, bail};
 pub fn copy_storage(source_root: &Path, target_root: &Path, names: &[&str]) -> Result<()> {
     fs::create_dir_all(target_root)
         .with_context(|| format!("创建目标目录 {}", target_root.display()))?;
-    let source_root = source_root.canonicalize()?;
-    let target_root = target_root.canonicalize()?;
+    let source_root = dunce::canonicalize(source_root)?;
+    let target_root = dunce::canonicalize(target_root)?;
     if source_root == target_root {
         return Ok(());
     }
@@ -64,8 +64,8 @@ pub fn copy_storage(source_root: &Path, target_root: &Path, names: &[&str]) -> R
 
 /// Remove the old storage after the new copy has been verified and activated.
 pub fn remove_source_storage(source_root: &Path, target_root: &Path, names: &[&str]) -> Result<()> {
-    let source_root = source_root.canonicalize()?;
-    let target_root = target_root.canonicalize()?;
+    let source_root = dunce::canonicalize(source_root)?;
+    let target_root = dunce::canonicalize(target_root)?;
     if source_root == target_root {
         return Ok(());
     }
