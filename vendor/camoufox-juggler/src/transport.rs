@@ -33,6 +33,30 @@ pub struct PipeTransport {
     pub read: tokio::fs::File,
     /// Set once the browser printed the ready line.
     pub ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Recent browser output to explain failures before Juggler is ready.
+    pub startup_output: StartupOutput,
+}
+
+#[derive(Clone, Default)]
+pub struct StartupOutput(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+
+impl StartupOutput {
+    fn push(&self, stream: &str, line: &str) {
+        let mut lines = self.0.lock().unwrap();
+        if lines.len() == 12 {
+            lines.pop_front();
+        }
+        lines.push_back(format!("{stream}: {}", line.chars().take(512).collect::<String>()));
+    }
+
+    fn suffix(&self) -> String {
+        let lines = self.0.lock().unwrap();
+        if lines.is_empty() {
+            String::new()
+        } else {
+            format!("; browser output: {}", lines.iter().cloned().collect::<Vec<_>>().join(" | "))
+        }
+    }
 }
 
 /// Spawns `prepared.executable_path` with the Juggler pipe connected.
@@ -99,6 +123,11 @@ async fn spawn_unix(
     let (b_read, b_write) = pipe_cloexec()?;
 
     let args = common_args(prepared, profile_dir, headless, extra_args);
+    log::info!(
+        "launching browser: executable={} profile={} headless={headless}",
+        prepared.executable_path.display(),
+        profile_dir.display()
+    );
 
     let mut command = tokio::process::Command::new(&prepared.executable_path);
     command
@@ -135,12 +164,13 @@ async fn spawn_unix(
     drop(b_write);
 
     let child = BrowserProcess::from_child(child);
-    let (child, ready) = spawn_output_drain(child);
+    let (child, ready, startup_output) = spawn_output_drain(child);
     Ok(PipeTransport {
         child,
         write: tokio::fs::File::from(std::fs::File::from(a_write)),
         read: tokio::fs::File::from(std::fs::File::from(b_read)),
         ready,
+        startup_output,
     })
 }
 
@@ -249,6 +279,11 @@ async fn spawn_windows(
 
     // Command line: application + quoted arguments.
     let args = common_args(prepared, profile_dir, headless, extra_args);
+    log::info!(
+        "launching browser: executable={} profile={} headless={headless}",
+        prepared.executable_path.display(),
+        profile_dir.display()
+    );
     let mut cmdline = quote_windows_arg(&prepared.executable_path.to_string_lossy());
     for arg in &args {
         cmdline.push(' ');
@@ -323,13 +358,14 @@ async fn spawn_windows(
     let mut child = BrowserProcess::from_raw(info.dwProcessId, info.hProcess);
     child.stdout = Some(file(stdout_read));
     child.stderr = Some(file(stderr_read));
-    let (child, ready) = spawn_output_drain(child);
+    let (child, ready, startup_output) = spawn_output_drain(child);
 
     Ok(PipeTransport {
         child,
         write: file(cmd_write),
         read: file(rsp_read),
         ready,
+        startup_output,
     })
 }
 
@@ -409,17 +445,19 @@ fn spawn_output_drain(
 ) -> (
     BrowserProcess,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
+    StartupOutput,
 ) {
     let mut child = child;
     // Take over stdout: readiness detection + log draining.
     let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output = StartupOutput::default();
     if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(drain_stdout(stdout, ready.clone()));
+        tokio::spawn(drain_stdout(stdout, ready.clone(), output.clone()));
     }
     if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(drain_stderr(stderr));
+        tokio::spawn(drain_stderr(stderr, output.clone()));
     }
-    (child, ready)
+    (child, ready, output)
 }
 
 /// Creates a pipe with `FD_CLOEXEC` set on both ends.
@@ -463,6 +501,7 @@ fn move_fd(from: std::os::raw::c_int, to: std::os::raw::c_int) -> std::io::Resul
 pub async fn wait_ready(
     child: &mut BrowserProcess,
     ready: &std::sync::atomic::AtomicBool,
+    output: &StartupOutput,
     timeout: std::time::Duration,
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -471,14 +510,21 @@ pub async fn wait_ready(
             return Ok(());
         }
         if let Ok(Some(status)) = child.try_wait() {
+            // Give the drain tasks time to read the final output after exit.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if ready.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
             return Err(JugglerError::Io(format!(
-                "browser exited before the Juggler pipe was ready (status {status})"
+                "browser exited before the Juggler pipe was ready (status {status}){}",
+                output.suffix()
             )));
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(JugglerError::Timeout(
-                "waiting for 'Juggler listening to the pipe'".into(),
-            ));
+            return Err(JugglerError::Timeout(format!(
+                "waiting for 'Juggler listening to the pipe'{}",
+                output.suffix()
+            )));
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -487,6 +533,7 @@ pub async fn wait_ready(
 async fn drain_stdout<R: tokio::io::AsyncRead + Unpin>(
     stdout: R,
     ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    output: StartupOutput,
 ) {
     use tokio::io::AsyncBufReadExt;
     let mut lines = tokio::io::BufReader::new(stdout).lines();
@@ -494,17 +541,44 @@ async fn drain_stdout<R: tokio::io::AsyncRead + Unpin>(
         if line.contains(JUGGLER_READY_LINE) {
             ready.store(true, std::sync::atomic::Ordering::Release);
         } else if !line.trim().is_empty() {
+            output.push("stdout", &line);
             log::debug!("[camoufox] {line}");
         }
     }
 }
 
-async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(stderr: R) {
+async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(stderr: R, output: StartupOutput) {
     use tokio::io::AsyncBufReadExt;
     let mut lines = tokio::io::BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if !line.trim().is_empty() {
+            output.push("stderr", &line);
             log::debug!("[camoufox:err] {line}");
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn startup_failure_includes_browser_stderr() {
+        let mut command = tokio::process::Command::new("sh");
+        let child = command
+            .arg("-c")
+            .arg("echo 'missing runtime dependency' >&2; exit 7")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut child, ready, output) =
+            spawn_output_drain(BrowserProcess::from_child(child));
+        let error = wait_ready(&mut child, &ready, &output, std::time::Duration::from_secs(2))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing runtime dependency"), "{error}");
+        assert!(error.contains("exit status: 7"), "{error}");
     }
 }

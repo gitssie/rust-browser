@@ -40,7 +40,7 @@ pub async fn launch_with_juggler(options: &LaunchOptions) -> Result<JugglerBrows
     let ready = transport.ready.clone();
     let mut child = transport.child;
     let connection = Arc::new(Connection::new(transport.write, transport.read));
-    if let Err(error) = wait_ready(&mut child, &ready, READY_TIMEOUT).await {
+    if let Err(error) = wait_ready(&mut child, &ready, &transport.startup_output, READY_TIMEOUT).await {
         kill_before_session(&mut child, &mut virtual_display).await;
         return Err(error);
     }

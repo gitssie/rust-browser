@@ -1,7 +1,8 @@
 //! Native profile home. Layout and interaction patterns follow rv's GPUI app.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -50,6 +51,24 @@ const MUTED: u32 = 0x718197;
 const LINE: u32 = 0xe1e8ef;
 const ROW_ALT: u32 = 0xf8fbfd;
 const SELECTED: u32 = 0xeafaf5;
+
+fn mirror_launch_output(mut source: impl Read + Send + 'static, mut log: File, stderr: bool) {
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            let size = match source.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(size) => size,
+            };
+            let _ = log.write_all(&buffer[..size]);
+            if stderr {
+                let _ = std::io::stderr().write_all(&buffer[..size]);
+            } else {
+                let _ = std::io::stdout().write_all(&buffer[..size]);
+            }
+        }
+    });
+}
 const RED: u32 = 0xd92d20;
 
 struct LaunchUi {
@@ -1366,6 +1385,7 @@ impl BrowserHome {
                 .create(true)
                 .append(true)
                 .open(self.paths.profile_log(&id))?;
+            let stdout_log = log.try_clone()?;
             let mut command = ProcessCommand::new(exe);
             command
                 .arg("--data-dir")
@@ -1375,20 +1395,26 @@ impl BrowserHome {
                 .arg("--progress-file")
                 .arg(&progress_file)
                 .stdin(Stdio::null())
-                .stdout(Stdio::from(log.try_clone()?))
-                .stderr(Stdio::from(log));
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             // The native manager uses the saved general proxy, including its
             // credentials, even if the manager inherited a CLI proxy override.
             command.env_remove("RUST_BROWSER_PROXY");
             #[cfg(unix)]
             command.process_group(0);
-            let child = match command.spawn() {
+            let mut child = match command.spawn() {
                 Ok(child) => child,
                 Err(error) => {
                     let _ = fs::remove_file(&progress_file);
                     return Err(error).context("start browser process");
                 }
             };
+            if let Some(stdout) = child.stdout.take() {
+                mirror_launch_output(stdout, stdout_log, false);
+            }
+            if let Some(stderr) = child.stderr.take() {
+                mirror_launch_output(stderr, log, true);
+            }
             Ok((child, progress_file))
         })();
         match result {

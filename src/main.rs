@@ -1125,7 +1125,12 @@ async fn run(cli: Cli) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(
+            "warn,camoufox_juggler::transport=debug,camoufox_juggler::driver=info",
+        ),
+    )
+    .init();
     run(Cli::parse()).await
 }
 
