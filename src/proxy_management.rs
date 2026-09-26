@@ -402,29 +402,38 @@ where
         .timeout(Duration::from_secs(10))
         .build()?;
     let mut last_error = anyhow::anyhow!("proxy exit IP did not change");
-    for attempt in 0..2 {
+    for _ in 0..2 {
         let request = match config.method {
             SwitchMethod::Get => client.get(&config.url),
             SwitchMethod::Post => client.post(&config.url),
         };
-        match request
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-        {
-            Ok(_) => {
-                sleep(wait).await;
-                match observe().await {
-                    Ok(geo) if geo.ip != before_ip => return Ok(geo),
-                    Ok(_) => last_error = anyhow::anyhow!("proxy exit IP remained {before_ip}"),
-                    Err(error) => last_error = error.context("verify proxy IP after switching"),
-                }
+        let response = request.send().await;
+        // A 429 (or a lost response) does not prove the provider ignored the
+        // action. Check the proxy exit after the configured propagation delay.
+        sleep(wait).await;
+        let observation = match observe().await {
+            Ok(geo) if geo.ip != before_ip => return Ok(geo),
+            Ok(_) => anyhow::anyhow!("proxy exit IP remained {before_ip}"),
+            Err(error) => error.context("could not verify proxy IP after switching"),
+        };
+        match response {
+            Ok(response) if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                return Err(observation).context(
+                    "switch-IP endpoint returned HTTP 429; wait for the provider's rate limit before trying again",
+                );
+            }
+            Ok(response) if response.status().is_success() => last_error = observation,
+            Ok(response) => {
+                last_error = observation.context(format!(
+                    "switch-IP endpoint returned HTTP {}",
+                    response.status()
+                ));
             }
             Err(error) => {
-                last_error = anyhow::Error::new(error).context("switch-IP HTTP request failed");
-                if attempt == 0 {
-                    sleep(wait).await;
-                }
+                last_error = observation.context(format!(
+                    "switch-IP HTTP request failed: {}",
+                    error.without_url()
+                ));
             }
         }
     }
@@ -679,5 +688,128 @@ mod tests {
         assert_eq!(result.ip, "203.0.113.11");
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert_eq!(observations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn http_429_can_still_mean_switch_succeeded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let config = IpSwitch {
+            url: format!("http://{address}/private-action-token"),
+            method: SwitchMethod::Get,
+            on_start: true,
+            wait_seconds: 10,
+        };
+        let result = switch_ip_with(
+            &config,
+            "203.0.113.10",
+            Duration::from_millis(5),
+            || async { Ok(geo("203.0.113.11")) },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(result.ip, "203.0.113.11");
+    }
+
+    #[tokio::test]
+    async fn second_request_429_succeeds_if_first_switch_becomes_visible() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for status in ["200 OK", "429 Too Many Requests"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 1024];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = IpSwitch {
+            url: format!("http://{address}/switch"),
+            method: SwitchMethod::Get,
+            on_start: true,
+            wait_seconds: 10,
+        };
+        let observations = Arc::new(AtomicUsize::new(0));
+        let result = switch_ip_with(&config, "203.0.113.10", Duration::from_millis(5), || {
+            let observations = observations.clone();
+            async move {
+                let attempt = observations.fetch_add(1, Ordering::SeqCst);
+                Ok(geo(if attempt == 0 {
+                    "203.0.113.10"
+                } else {
+                    "203.0.113.11"
+                }))
+            }
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(result.ip, "203.0.113.11");
+        assert_eq!(observations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn http_429_without_ip_change_does_not_repeat_action_or_expose_url() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let config = IpSwitch {
+            url: format!("http://{address}/private-action-token"),
+            method: SwitchMethod::Get,
+            on_start: true,
+            wait_seconds: 10,
+        };
+        let error = switch_ip_with(
+            &config,
+            "203.0.113.10",
+            Duration::from_millis(5),
+            || async { Ok(geo("203.0.113.10")) },
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        let message = format!("{error:#}");
+        assert!(message.contains("429"));
+        assert!(!message.contains("private-action-token"));
     }
 }

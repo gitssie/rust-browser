@@ -207,7 +207,7 @@ enum ProxyAction {
         switch_method: SwitchMethodArg,
         #[arg(long, requires = "switch_url")]
         rotate_on_start: bool,
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 10)]
         wait_seconds: u64,
     },
     /// Remove a managed rule; saved profiles and proxy URLs are untouched.

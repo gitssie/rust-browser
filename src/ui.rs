@@ -844,7 +844,7 @@ impl BrowserHome {
                     .ip_switch
                     .as_ref()
                     .map(|switch| switch.wait_seconds)
-                    .unwrap_or(3);
+                    .unwrap_or(10);
                 let credentials = proxy.credentials.unwrap_or(ProxyCredentials {
                     username: String::new(),
                     password: String::new(),
@@ -1143,7 +1143,7 @@ impl BrowserHome {
             cx.new(|cx| InputState::new(window, cx).placeholder("可选").masked(true));
         let managed_switch_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://..."));
-        let managed_wait = cx.new(|cx| InputState::new(window, cx).default_value("3"));
+        let managed_wait = cx.new(|cx| InputState::new(window, cx).default_value("10"));
         let subscription =
             cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
