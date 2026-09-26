@@ -10,6 +10,38 @@ use crate::proxy::{DEFAULT_PROXY, ProxySettings};
 use crate::storage;
 
 const GENERAL_KEY: &str = "general_proxy";
+const BROWSER_DOWNLOAD_KEY: &str = "browser_download";
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserDownloadSettings {
+    pub use_global_proxy: bool,
+}
+
+impl BrowserDownloadSettings {
+    pub fn load(root: &Path) -> Result<Self> {
+        let conn = storage::connection(root)?;
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                [BROWSER_DOWNLOAD_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .unwrap_or_else(|| Ok(Self::default()))
+    }
+
+    pub fn save(&self, root: &Path) -> Result<()> {
+        let conn = storage::connection(root)?;
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![BROWSER_DOWNLOAD_KEY, serde_json::to_string(self)?],
+        )?;
+        Ok(())
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneralSettings {
@@ -94,6 +126,26 @@ mod tests {
         assert_eq!(
             settings.proxy().unwrap().browser_url(),
             "socks5://proxy.example:1080"
+        );
+    }
+
+    #[test]
+    fn browser_download_proxy_choice_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !BrowserDownloadSettings::load(dir.path())
+                .unwrap()
+                .use_global_proxy
+        );
+        BrowserDownloadSettings {
+            use_global_proxy: true,
+        }
+        .save(dir.path())
+        .unwrap();
+        assert!(
+            BrowserDownloadSettings::load(dir.path())
+                .unwrap()
+                .use_global_proxy
         );
     }
 }

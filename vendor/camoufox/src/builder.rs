@@ -128,6 +128,10 @@ pub struct LaunchOptions {
     /// Custom browser executable path.
     pub executable_path: Option<PathBuf>,
 
+    /// Browser installation used for version, addon and font resources.
+    /// Defaults to the package manager's installation directory.
+    pub install_root: Option<PathBuf>,
+
     /// Firefox user preferences to set.
     pub firefox_user_prefs: BTreeMap<String, Value>,
 
@@ -208,6 +212,10 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
     }
     let mut config: ConfigMap = ConfigMap::new();
     let mut firefox_user_prefs = options.firefox_user_prefs.clone();
+    let install_root = options
+        .install_root
+        .clone()
+        .unwrap_or_else(camoufox_pkgman::install_dir);
 
     // Warn on manual config domains (before the fingerprint merge — the
     // generated config legitimately touches these domains).
@@ -220,7 +228,16 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
     // Add default addons and validate paths.
     let mut addons = options.addons.clone();
     if !addons.is_empty() || options.exclude_addons.is_empty() {
-        camoufox_pkgman::add_default_addons(&mut addons, &options.exclude_addons).await?;
+        if options.install_root.is_some() {
+            camoufox_pkgman::add_default_addons_at(
+                &install_root,
+                &mut addons,
+                &options.exclude_addons,
+            )
+            .await?;
+        } else {
+            camoufox_pkgman::add_default_addons(&mut addons, &options.exclude_addons).await?;
+        }
     }
     if !addons.is_empty() {
         camoufox_pkgman::confirm_paths(&addons)?;
@@ -236,7 +253,8 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
             warnings::warn_leak("ff_version", Some(options.i_know_what_im_doing));
             version.clone()
         }
-        None => camoufox_pkgman::installed_ver_str()?
+        None => camoufox_pkgman::CamoufoxVersion::from_path(&install_root)?
+            .full_string()
             .split('.')
             .next()
             .unwrap_or_default()
@@ -284,7 +302,7 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
     // Seeds (spacing/audio/canvas): only what the installed browser declares.
     let known_properties = camoufox_core::config::load_properties(
         options.executable_path.as_deref(),
-        &camoufox_pkgman::install_dir(),
+        &install_root,
     )
     .unwrap_or_default();
     for seed in SEED_PROPERTIES {
@@ -471,8 +489,7 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
     validate_config(&config, &known_properties)?;
 
     // Env vars: config chunks + fontconfig + caller overrides.
-    let fontconfig_root = camoufox_pkgman::install_dir();
-    let mut env = get_env_vars(&config, target_os, Some(&fontconfig_root))?;
+    let mut env = get_env_vars(&config, target_os, Some(&install_root))?;
     for (key, value) in &options.env {
         env.insert(key.clone(), value.clone());
     }

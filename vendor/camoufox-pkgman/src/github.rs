@@ -74,9 +74,33 @@ impl GitHubDownloader {
     where
         F: Fn(&Asset) -> Option<(CamoufoxVersion, String)>,
     {
-        let client = reqwest::Client::builder()
+        self.get_asset_with_proxy(check, retries, None, false).await
+    }
+
+    /// Fetches a release using an explicit proxy, or a direct connection when
+    /// `direct` is true. This keeps app-level download routing independent of
+    /// the user's browser profile proxy.
+    pub async fn get_asset_with_proxy<F>(
+        &self,
+        check: F,
+        retries: u32,
+        proxy_url: Option<&str>,
+        direct: bool,
+    ) -> Result<ReleaseAsset>
+    where
+        F: Fn(&Asset) -> Option<(CamoufoxVersion, String)>,
+    {
+        let mut builder = reqwest::Client::builder()
             .user_agent(concat!("camoufox-rust/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(30));
+        if let Some(url) = proxy_url {
+            builder = builder.proxy(
+                reqwest::Proxy::all(url).map_err(|e| CamoufoxError::Http(e.to_string()))?,
+            );
+        } else if direct {
+            builder = builder.no_proxy();
+        }
+        let client = builder
             .build()
             .map_err(|e| CamoufoxError::Http(e.to_string()))?;
 

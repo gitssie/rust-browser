@@ -1,8 +1,6 @@
 //! Local control socket for live CLI browser sessions.
 
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -11,9 +9,11 @@ use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::paths::AppPaths;
+
 #[derive(Clone)]
 pub struct BrowserRuntime {
-    directory: PathBuf,
+    paths: AppPaths,
 }
 
 pub struct BrowserListener {
@@ -29,23 +29,19 @@ impl Drop for BrowserListener {
 
 impl BrowserRuntime {
     pub fn new(data_dir: &Path) -> Self {
-        let mut hasher = DefaultHasher::new();
-        data_dir.hash(&mut hasher);
         Self {
-            directory: std::env::temp_dir().join(format!("cazer-browser-{:016x}", hasher.finish())),
+            paths: AppPaths::for_root(data_dir),
         }
     }
 
     fn path(&self, id: &str) -> PathBuf {
-        let mut hasher = DefaultHasher::new();
-        id.hash(&mut hasher);
-        self.directory
-            .join(format!("{:016x}.sock", hasher.finish()))
+        self.paths.runtime_socket(id)
     }
 
     pub async fn bind(&self, id: &str) -> Result<BrowserListener> {
-        fs::create_dir_all(&self.directory)?;
-        fs::set_permissions(&self.directory, fs::Permissions::from_mode(0o700))?;
+        let directory = self.paths.runtime_sockets();
+        fs::create_dir_all(&directory)?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
         let path = self.path(id);
         if path.exists() {
             if self.is_running(id).await {

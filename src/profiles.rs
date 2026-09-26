@@ -1,4 +1,6 @@
 use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use camoufox_core::fingerprint::FingerprintRequest;
@@ -14,6 +16,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::geo::ProfileGeo;
+use crate::paths::AppPaths;
 use crate::proxy::ProxySettings;
 use crate::proxy_management::ProxyCatalog;
 use crate::storage;
@@ -235,7 +238,7 @@ pub struct ProfileView {
 /// All profile metadata is stored in camoufox-store; browser state stays in its own directory.
 #[derive(Clone)]
 pub struct ProfileService {
-    root: PathBuf,
+    paths: AppPaths,
     global_proxy: ProxySettings,
 }
 
@@ -247,40 +250,45 @@ impl ProfileService {
     }
 
     pub fn with_proxy(data_dir: impl AsRef<Path>, proxy: ProxySettings) -> ProfileResult<Self> {
-        fs::create_dir_all(data_dir.as_ref())
+        let paths =
+            AppPaths::new(Some(data_dir.as_ref().to_path_buf())).map_err(ProfileError::Storage)?;
+        storage::open_store(paths.root()).map_err(ProfileError::Storage)?;
+        let profiles_dir = paths.profiles();
+        fs::create_dir_all(&profiles_dir).map_err(|error| ProfileError::Storage(error.into()))?;
+        #[cfg(unix)]
+        fs::set_permissions(&profiles_dir, fs::Permissions::from_mode(0o700))
             .map_err(|error| ProfileError::Storage(error.into()))?;
-        let root = data_dir
-            .as_ref()
-            .canonicalize()
-            .map_err(|error| ProfileError::Storage(error.into()))?;
-        storage::open_store(&root).map_err(ProfileError::Storage)?;
         Ok(Self {
-            root,
+            paths,
             global_proxy: proxy,
         })
     }
 
     pub fn data_dir(&self) -> &Path {
-        &self.root
+        self.paths.root()
+    }
+
+    pub fn profiles_dir(&self) -> PathBuf {
+        self.paths.profiles()
     }
 
     fn store(&self) -> ProfileResult<PersonaStore> {
-        storage::open_store(&self.root).map_err(ProfileError::Storage)
+        storage::open_store(self.paths.root()).map_err(ProfileError::Storage)
     }
 
     fn browser_data_dir(&self, id: &str) -> PathBuf {
-        self.root.join("profiles").join(id)
+        self.paths.profile(id)
     }
 
     fn lock(&self, id: &str) -> ProfileResult<File> {
-        fs::create_dir_all(self.root.join("locks"))
+        fs::create_dir_all(self.paths.locks())
             .map_err(|error| ProfileError::Storage(error.into()))?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(self.root.join("locks").join(format!("{id}.lock")))
+            .open(self.paths.profile_lock(id))
             .map_err(|error| ProfileError::Storage(error.into()))?;
         file.try_lock_exclusive()
             .map_err(|_| ProfileError::Busy(id.to_string()))?;
@@ -288,14 +296,14 @@ impl ProfileService {
     }
 
     fn tag_lock(&self, id: &str) -> ProfileResult<File> {
-        fs::create_dir_all(self.root.join("locks"))
+        fs::create_dir_all(self.paths.locks())
             .map_err(|error| ProfileError::Storage(error.into()))?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(self.root.join("locks").join(format!("{id}.tags.lock")))
+            .open(self.paths.profile_tags_lock(id))
             .map_err(|error| ProfileError::Storage(error.into()))?;
         file.try_lock_exclusive()
             .map_err(|_| ProfileError::Busy(id.to_string()))?;
@@ -305,7 +313,7 @@ impl ProfileService {
     fn resolve_proxy(&self, choice: &ProxyChoice) -> ProfileResult<ProxySettings> {
         match choice {
             ProxyChoice::Global => Ok(self.global_proxy.clone()),
-            ProxyChoice::Custom(url) => ProxyCatalog::new(&self.root)
+            ProxyChoice::Custom(url) => ProxyCatalog::new(self.paths.root())
                 .resolve_url(url)
                 .map_err(|error| ProfileError::Invalid(error.to_string())),
         }
@@ -591,7 +599,7 @@ impl ProfileService {
             Err(ProfileError::Busy(_)) if tags_only => {
                 #[cfg(unix)]
                 {
-                    if !crate::runtime::BrowserRuntime::new(&self.root)
+                    if !crate::runtime::BrowserRuntime::new(self.paths.root())
                         .is_running(id)
                         .await
                     {
@@ -637,9 +645,11 @@ impl ProfileService {
         }
         let browser_data = self.browser_data_dir(id);
         let quarantined = if browser_data.exists() {
-            let trash = self.root.join("trash");
+            let trash = self.paths.trash();
             fs::create_dir_all(&trash).map_err(|error| ProfileError::Storage(error.into()))?;
-            let destination = trash.join(format!("{id}-{}", rand::thread_rng().r#gen::<u64>()));
+            let destination = self
+                .paths
+                .trashed_profile(id, rand::thread_rng().r#gen::<u64>());
             fs::rename(&browser_data, &destination)
                 .map_err(|error| ProfileError::Storage(error.into()))?;
             Some(destination)
@@ -656,13 +666,7 @@ impl ProfileService {
         if let Some(destination) = quarantined {
             fs::remove_dir_all(destination).map_err(|error| ProfileError::Storage(error.into()))?;
         }
-        for suffix in [
-            "browserscan.png",
-            "browserscan.txt",
-            "browserscan-fields.json",
-            "fingerprint.json",
-        ] {
-            let artifact = self.root.join("artifacts").join(format!("{id}-{suffix}"));
+        for artifact in self.paths.scan_artifacts(id).all() {
             match fs::remove_file(artifact) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -827,6 +831,27 @@ mod tests {
             proxy,
             geo: None,
         }
+    }
+
+    #[test]
+    fn empty_profile_directory_is_ready_for_settings_to_open() {
+        let root = tempfile::tempdir().unwrap();
+        let service = ProfileService::new(root.path(), "socks5://127.0.0.1:12334").unwrap();
+        assert!(service.data_dir().join("profiles").is_dir());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(service.profiles_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(service.data_dir().join("browser.sqlite").is_file());
+        assert_eq!(
+            service.browser_data_dir("alpha"),
+            service.data_dir().join("profiles/alpha")
+        );
     }
 
     #[test]

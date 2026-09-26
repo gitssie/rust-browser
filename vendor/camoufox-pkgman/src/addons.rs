@@ -55,18 +55,74 @@ pub async fn add_default_addons(
     addons_list: &mut Vec<String>,
     exclude: &[DefaultAddon],
 ) -> Result<()> {
-    let mut addons: Vec<(DefaultAddon, &'static str)> = DEFAULT_ADDONS
+    maybe_download_addons(default_addons(exclude), addons_list).await
+}
+
+/// Appends default addons from an explicitly selected browser installation.
+/// Unlike `add_default_addons`, this never resolves or installs a browser via
+/// the process-wide default installation directory.
+pub async fn add_default_addons_at(
+    install_root: &Path,
+    addons_list: &mut Vec<String>,
+    exclude: &[DefaultAddon],
+) -> Result<()> {
+    if skip_addon_download() {
+        return Ok(());
+    }
+    let resources = if camoufox_core::os::host_os() == camoufox_core::os::OsName::Mac {
+        install_root.join("Camoufox.app/Contents/Resources")
+    } else {
+        install_root.to_path_buf()
+    };
+    for (addon, url) in default_addons(exclude) {
+        download_one_addon(
+            addon,
+            &url,
+            resources.join("addons").join(addon.dir_name()),
+            addons_list,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn default_addons(exclude: &[DefaultAddon]) -> Vec<(DefaultAddon, String)> {
+    let mut addons: Vec<_> = DEFAULT_ADDONS
         .iter()
         .filter(|addon| !exclude.contains(addon))
-        .map(|addon| (*addon, addon.url()))
+        .map(|addon| (*addon, addon.url().to_string()))
         .collect();
-    // Deterministic order.
     addons.sort_by_key(|(addon, _)| addon.dir_name());
-    let addons: Vec<(DefaultAddon, String)> = addons
-        .into_iter()
-        .map(|(addon, url)| (addon, url.to_string()))
-        .collect();
-    maybe_download_addons(addons, addons_list).await
+    addons
+}
+
+fn skip_addon_download() -> bool {
+    let skip = camoufox_core::env_utils::skip_browser_download();
+    if skip {
+        log::info!("Skipping addon download due to PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD set!");
+    }
+    skip
+}
+
+async fn download_one_addon(
+    addon: DefaultAddon,
+    url: &str,
+    addon_path: std::path::PathBuf,
+    addons_list: &mut Vec<String>,
+) -> Result<()> {
+    if addon_path.exists() {
+        addons_list.push(addon_path.to_string_lossy().into_owned());
+        return Ok(());
+    }
+    std::fs::create_dir_all(&addon_path)?;
+    match download_and_extract(url, &addon_path, addon.dir_name()).await {
+        Ok(()) => addons_list.push(addon_path.to_string_lossy().into_owned()),
+        Err(error) => {
+            log::error!("Failed to download and extract {}: {error}", addon.dir_name());
+            let _ = std::fs::remove_dir_all(&addon_path);
+        }
+    }
+    Ok(())
 }
 
 /// Downloads and extracts addons, skipping ones already on disk.
@@ -77,29 +133,14 @@ pub async fn maybe_download_addons(
     addons: Vec<(DefaultAddon, String)>,
     addons_list: &mut Vec<String>,
 ) -> Result<()> {
-    if camoufox_core::env_utils::skip_browser_download() {
-        log::info!("Skipping addon download due to PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD set!");
+    if skip_addon_download() {
         return Ok(());
     }
 
     for (addon, url) in addons {
         let addon_path = crate::paths::get_path(format!("addons/{}", addon.dir_name())).await?;
 
-        if addon_path.exists() {
-            addons_list.push(addon_path.to_string_lossy().into_owned());
-            continue;
-        }
-
-        std::fs::create_dir_all(&addon_path)?;
-        match download_and_extract(&url, &addon_path, addon.dir_name()).await {
-            Ok(()) => {
-                addons_list.push(addon_path.to_string_lossy().into_owned());
-            }
-            Err(e) => {
-                log::error!("Failed to download and extract {}: {e}", addon.dir_name());
-                let _ = std::fs::remove_dir_all(&addon_path);
-            }
-        }
+        download_one_addon(addon, &url, addon_path, addons_list).await?;
     }
     Ok(())
 }

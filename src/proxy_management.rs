@@ -1,9 +1,7 @@
 //! Managed proxy policy shared by CLI launches and the native manager.
 
-use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -16,6 +14,7 @@ use url::Url;
 
 use crate::geo::ProfileGeo;
 use crate::launch_progress::LaunchStage;
+use crate::paths::AppPaths;
 use crate::profiles::{ProfileQuery, ProfileService, ProxyChoice};
 use crate::proxy::ProxySettings;
 #[cfg(unix)]
@@ -202,16 +201,15 @@ pub struct ProxyLaunchGuard(File);
 
 impl ProxyLaunchGuard {
     async fn acquire(root: &Path, address: &str) -> Result<Self> {
-        let mut hasher = DefaultHasher::new();
-        address.hash(&mut hasher);
-        let locks = root.join("locks");
+        let paths = AppPaths::for_root(root);
+        let locks = paths.locks();
         fs::create_dir_all(&locks)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(locks.join(format!("proxy-{:016x}.lock", hasher.finish())))?;
+            .open(paths.proxy_lock(address))?;
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match file.try_lock_exclusive() {
@@ -364,7 +362,7 @@ async fn profile_is_active(root: &Path, id: &str, runtime: &BrowserRuntime) -> R
 
 #[cfg(unix)]
 fn profile_lock_released(root: &Path, id: &str) -> Result<bool> {
-    let path = root.join("locks").join(format!("{id}.lock"));
+    let path = AppPaths::for_root(root).profile_lock(id);
     let file = match OpenOptions::new().read(true).write(true).open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),

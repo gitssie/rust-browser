@@ -11,10 +11,11 @@ mod paths;
 pub mod version;
 
 pub use addons::{
-    add_default_addons, confirm_paths, maybe_download_addons, DefaultAddon, DEFAULT_ADDONS,
+    add_default_addons, add_default_addons_at, confirm_paths, maybe_download_addons, DefaultAddon,
+    DEFAULT_ADDONS,
 };
 pub use github::{github_authorization_headers, GitHubDownloader};
-pub use install::{extract_zip, install, webdl, CamoufoxFetcher};
+pub use install::{extract_zip, install, make_executable, webdl, CamoufoxFetcher};
 pub use paths::{
     camoufox_path, get_path, install_dir, launch_path, local_data_dir, os_arch_matrix,
     platform_arch, set_install_dir, INSTALL_DIR_ENV,

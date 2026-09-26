@@ -6,6 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -20,8 +21,12 @@ use gpui_component::{
     scroll::ScrollableElement,
     v_flex,
 };
+use rust_browser::browser_manager::{
+    BrowserManager, DownloadControl, DownloadProgress, DownloadStage, InstalledVersion, Release,
+};
 use rust_browser::geo::ProfileGeo;
 use rust_browser::launch_progress::{LaunchEvent, LaunchStage, read_events};
+use rust_browser::paths::AppPaths;
 use rust_browser::profiles::{
     CreateProfile, ProfileGeoInput, ProfileListFilter, ProfileOs, ProfileQuery, ProfileService,
     ProfileView, ProxyChoice, ProxyModeFilter, UpdateProfile,
@@ -31,7 +36,7 @@ use rust_browser::proxy_management::{
     IpSwitch, ManagedProxy, ProxyCatalog, ProxyCredentials, ProxyPolicy, SwitchMethod,
 };
 use rust_browser::runtime::BrowserRuntime;
-use rust_browser::settings::GeneralSettings;
+use rust_browser::settings::{BrowserDownloadSettings, GeneralSettings};
 use rust_browser::tags::TagCatalog;
 
 use crate::Paths;
@@ -126,11 +131,19 @@ enum SettingsTab {
     Data,
 }
 
+struct InitialSettings {
+    general: GeneralSettings,
+    browser_download: BrowserDownloadSettings,
+}
+
 pub fn run(paths: Paths, global_proxy: ProxySettings) -> Result<()> {
-    let service = ProfileService::with_proxy(&paths.root, global_proxy.clone())?;
-    let runtime = BrowserRuntime::new(&paths.root);
+    let service = ProfileService::with_proxy(paths.root(), global_proxy.clone())?;
+    let runtime = BrowserRuntime::new(paths.root());
     let tokio = tokio::runtime::Handle::current();
-    let general = GeneralSettings::load(&paths.root)?;
+    let initial_settings = InitialSettings {
+        general: GeneralSettings::load(paths.root())?,
+        browser_download: BrowserDownloadSettings::load(paths.root())?,
+    };
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx| {
         gpui_component::init(cx);
@@ -142,7 +155,15 @@ pub fn run(paths: Paths, global_proxy: ProxySettings) -> Result<()> {
         cx.spawn(async move |cx| {
             cx.open_window(options, move |window, cx| {
                 let home = cx.new(|cx| {
-                    BrowserHome::new(service, runtime, tokio, general, global_proxy, window, cx)
+                    BrowserHome::new(
+                        service,
+                        runtime,
+                        tokio,
+                        initial_settings,
+                        global_proxy,
+                        window,
+                        cx,
+                    )
                 });
                 cx.new(|cx| Root::new(home, window, cx))
             })
@@ -154,6 +175,7 @@ pub fn run(paths: Paths, global_proxy: ProxySettings) -> Result<()> {
 }
 
 struct BrowserHome {
+    paths: AppPaths,
     service: ProfileService,
     runtime: BrowserRuntime,
     tokio: tokio::runtime::Handle,
@@ -170,6 +192,17 @@ struct BrowserHome {
     general_test: String,
     general_testing: bool,
     general_test_generation: u64,
+    browser_download_settings: BrowserDownloadSettings,
+    browser_versions: Vec<InstalledVersion>,
+    browser_latest: Option<Release>,
+    browser_checking: bool,
+    browser_busy: bool,
+    browser_status: String,
+    browser_progress: Option<DownloadProgress>,
+    browser_progress_shared: Option<Arc<Mutex<Option<DownloadProgress>>>>,
+    browser_control: Option<DownloadControl>,
+    browser_versions_expanded: bool,
+    browser_delete_pending: Option<String>,
     managed: Vec<ManagedProxy>,
     managed_selected: Option<String>,
     managed_id: Entity<InputState>,
@@ -232,6 +265,215 @@ struct BrowserHome {
 }
 
 impl BrowserHome {
+    fn browser_manager(&self) -> BrowserManager {
+        BrowserManager::new(self.service.data_dir())
+    }
+
+    fn refresh_browser_versions(&mut self) {
+        match self.browser_manager().installed_versions() {
+            Ok(versions) => self.browser_versions = versions,
+            Err(error) => self.browser_status = format!("读取已安装版本失败：{error}"),
+        }
+    }
+
+    fn browser_download_proxy(&self) -> Result<Option<ProxySettings>> {
+        if self.browser_download_settings.use_global_proxy {
+            Ok(Some(
+                GeneralSettings::load(self.service.data_dir())?.proxy()?,
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn check_browser_update(&mut self, cx: &mut Context<Self>) {
+        if self.browser_checking || self.browser_busy {
+            return;
+        }
+        let proxy = match self.browser_download_proxy() {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                self.browser_status = format!("代理配置无效：{error}");
+                cx.notify();
+                return;
+            }
+        };
+        self.browser_checking = true;
+        self.browser_status = "正在检查 Camoufox 版本…".into();
+        let manager = self.browser_manager();
+        let tokio = self.tokio.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(
+                    async move { tokio.block_on(async { manager.latest(proxy.as_ref()).await }) },
+                )
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.browser_checking = false;
+                match result {
+                    Ok(release) => {
+                        let current = this.browser_versions.iter().find(|version| version.active);
+                        this.browser_status =
+                            if current.is_some_and(|current| current.version == release.version) {
+                                "当前已是最新支持版本".into()
+                            } else {
+                                format!("发现版本 {}", release.version.full_string())
+                            };
+                        this.browser_latest = Some(release);
+                    }
+                    Err(error) => this.browser_status = format!("检查更新失败：{error}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_browser_download(&mut self, cx: &mut Context<Self>) {
+        if self.browser_busy || self.browser_checking {
+            return;
+        }
+        if !self.running.is_empty()
+            || !self.spawned.is_empty()
+            || self.busy
+            || self.launch.is_some()
+        {
+            self.browser_status = "请先关闭正在运行的浏览器，再安装版本".into();
+            cx.notify();
+            return;
+        }
+        let Some(release) = self.browser_latest.clone() else {
+            self.browser_status = "请先检查更新".into();
+            cx.notify();
+            return;
+        };
+        if self
+            .browser_versions
+            .iter()
+            .any(|item| item.active && item.version == release.version)
+        {
+            self.browser_status = "当前已安装此版本".into();
+            cx.notify();
+            return;
+        }
+        if self
+            .browser_versions
+            .iter()
+            .any(|item| !item.active && item.version == release.version)
+        {
+            self.activate_browser_version(release.version, cx);
+            return;
+        }
+        let proxy = match self.browser_download_proxy() {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                self.browser_status = format!("代理配置无效：{error}");
+                cx.notify();
+                return;
+            }
+        };
+        let control = DownloadControl::default();
+        let shared = Arc::new(Mutex::new(None));
+        self.browser_busy = true;
+        self.browser_progress = Some(DownloadProgress {
+            stage: DownloadStage::Download,
+            received: 0,
+            total: None,
+        });
+        self.browser_progress_shared = Some(shared.clone());
+        self.browser_control = Some(control.clone());
+        self.browser_status = "正在下载浏览器…".into();
+        self.poll_browser_progress(cx);
+        let manager = self.browser_manager();
+        let tokio = self.tokio.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    tokio.block_on(async {
+                        manager
+                            .download_and_install(&release, proxy.as_ref(), &control, |progress| {
+                                if let Ok(mut current) = shared.lock() {
+                                    *current = Some(progress);
+                                }
+                            })
+                            .await
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.browser_busy = false;
+                this.browser_control = None;
+                this.browser_progress_shared = None;
+                this.browser_progress = None;
+                this.browser_status = match result {
+                    Ok(()) => "Camoufox 安装完成".into(),
+                    Err(error) => format!("浏览器安装失败：{error}"),
+                };
+                this.refresh_browser_versions();
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn poll_browser_progress(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.browser_busy {
+                    return;
+                }
+                if let Some(shared) = &this.browser_progress_shared
+                    && let Ok(value) = shared.lock()
+                {
+                    this.browser_progress = value.clone();
+                }
+                this.poll_browser_progress(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn activate_browser_version(
+        &mut self,
+        version: camoufox_pkgman::version::CamoufoxVersion,
+        cx: &mut Context<Self>,
+    ) {
+        if self.browser_busy || !self.running.is_empty() || self.busy || self.launch.is_some() {
+            self.browser_status = "请先关闭正在运行的浏览器，再切换版本".into();
+        } else {
+            self.browser_status = match self.browser_manager().activate(&version) {
+                Ok(()) => format!("已切换到 {}", version.full_string()),
+                Err(error) => format!("切换失败：{error}"),
+            };
+            self.refresh_browser_versions();
+        }
+        cx.notify();
+    }
+
+    fn delete_browser_version(
+        &mut self,
+        version: camoufox_pkgman::version::CamoufoxVersion,
+        cx: &mut Context<Self>,
+    ) {
+        if self.browser_busy {
+            self.browser_status = "请等待浏览器安装结束".into();
+        } else {
+            self.browser_status = match self.browser_manager().delete_archived(&version) {
+                Ok(()) => format!("已删除 {}", version.full_string()),
+                Err(error) => format!("删除失败：{error}"),
+            };
+            self.refresh_browser_versions();
+        }
+        cx.notify();
+    }
+
     fn general_from_inputs(&self, cx: &App) -> Result<GeneralSettings> {
         let settings = GeneralSettings {
             host: self.general_host.read(cx).value().trim().to_string(),
@@ -270,6 +512,7 @@ impl BrowserHome {
                     Ok((settings, proxy)) => {
                         this.general = settings;
                         this.global_proxy = proxy.clone();
+                        this.browser_latest = None;
                         match ProfileService::with_proxy(this.service.data_dir(), proxy) {
                             Ok(service) => this.service = service,
                             Err(error) => {
@@ -582,11 +825,15 @@ impl BrowserHome {
         service: ProfileService,
         runtime: BrowserRuntime,
         tokio: tokio::runtime::Handle,
-        general: GeneralSettings,
+        initial_settings: InitialSettings,
         global_proxy: ProxySettings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let InitialSettings {
+            general,
+            browser_download: browser_download_settings,
+        } = initial_settings;
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索名称或 ID"));
         let form_id = cx.new(|cx| InputState::new(window, cx).placeholder("例如 vinted-fr-01"));
         let form_name = cx.new(|cx| InputState::new(window, cx).placeholder("显示名称"));
@@ -694,7 +941,14 @@ impl BrowserHome {
         let managed = ProxyCatalog::new(service.data_dir())
             .list()
             .unwrap_or_default();
+        let paths = AppPaths::for_root(service.data_dir());
+        let browser_manager = BrowserManager::new(service.data_dir());
+        let (browser_versions, browser_status) = match browser_manager.installed_versions() {
+            Ok(versions) => (versions, String::new()),
+            Err(error) => (Vec::new(), format!("读取已安装版本失败：{error}")),
+        };
         let mut this = Self {
+            paths,
             service,
             runtime,
             tokio,
@@ -711,6 +965,17 @@ impl BrowserHome {
             general_test: String::new(),
             general_testing: false,
             general_test_generation: 0,
+            browser_download_settings,
+            browser_versions,
+            browser_latest: None,
+            browser_checking: false,
+            browser_busy: false,
+            browser_status,
+            browser_progress: None,
+            browser_progress_shared: None,
+            browser_control: None,
+            browser_versions_expanded: true,
+            browser_delete_pending: None,
             managed,
             managed_selected: None,
             managed_id,
@@ -904,6 +1169,11 @@ impl BrowserHome {
     }
 
     fn open_browser(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.browser_busy {
+            self.status = "浏览器版本正在安装，请稍后打开".into();
+            cx.notify();
+            return;
+        }
         if self.running.contains(&id) || self.spawned.contains_key(&id) || self.launch.is_some() {
             return;
         }
@@ -918,10 +1188,9 @@ impl BrowserHome {
         );
         let result = (|| -> Result<(Child, PathBuf)> {
             let exe = std::env::current_exe()?;
-            let log_dir = self.service.data_dir().join("logs");
+            let log_dir = self.paths.logs();
             fs::create_dir_all(&log_dir)?;
-            let progress_file =
-                log_dir.join(format!("launch-{id}-{:016x}.jsonl", rand::random::<u64>()));
+            let progress_file = self.paths.launch_progress(&id, rand::random::<u64>());
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -929,7 +1198,7 @@ impl BrowserHome {
             let log = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(log_dir.join(format!("{id}.log")))?;
+                .open(self.paths.profile_log(&id))?;
             let mut command = ProcessCommand::new(exe);
             command
                 .arg("--data-dir")
@@ -1039,7 +1308,10 @@ impl BrowserHome {
         if let Some(child) = self.spawned.get_mut(&id)
             && let Ok(Some(status)) = child.try_wait()
         {
-            launch.error = Some(format!("启动进程已退出（{status}），请查看 logs/{id}.log"));
+            launch.error = Some(format!(
+                "启动进程已退出（{status}），请查看 {}",
+                self.paths.profile_log(&id).display()
+            ));
             launch.visible = true;
             self.status = format!("打开 {id} 失败");
             let _ = fs::remove_file(path);
@@ -2282,12 +2554,120 @@ impl BrowserHome {
             .into_any_element()
     }
 
-    fn render_data_settings(&self) -> AnyElement {
-        let root = self.service.data_dir();
-        let browser = root.join("browser");
+    fn render_data_settings(&self, narrow: bool, cx: &mut Context<Self>) -> AnyElement {
+        let manager = self.browser_manager();
+        let current = self.browser_versions.iter().find(|version| version.active);
+        let current_label = current
+            .map(|version| version.version.full_string())
+            .unwrap_or_else(|| "尚未安装".into());
+        let latest_label = self
+            .browser_latest
+            .as_ref()
+            .map(|release| release.version.full_string())
+            .unwrap_or_else(|| "尚未检查".into());
+        let has_update = self.browser_latest.as_ref().is_some_and(|release| {
+            current.is_none_or(|current| current.version != release.version)
+        });
+        let entity = cx.entity();
+        let mut version_rows = v_flex().gap_2();
+        for installed in &self.browser_versions {
+            let version = installed.version.clone();
+            let version_for_delete = version.clone();
+            let key = version.full_string();
+            let active = installed.active;
+            let pending = self.browser_delete_pending.as_deref() == Some(key.as_str());
+            version_rows = version_rows.child(
+                h_flex()
+                    .w_full()
+                    .p_3()
+                    .items_center()
+                    .gap_4()
+                    .rounded_md()
+                    .bg(rgb(ROW_ALT))
+                    .child(
+                        div()
+                            .w(px(160.))
+                            .font_semibold()
+                            .text_color(rgb(INK))
+                            .child(key.clone()),
+                    )
+                    .child(if active { "当前使用" } else { "已安装" })
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(installed.path.display().to_string()),
+                    )
+                    .child(
+                        Button::new(format!("browser-activate-{key}"))
+                            .outline()
+                            .small()
+                            .label("设为当前")
+                            .disabled(active || self.browser_busy || !self.running.is_empty())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.activate_browser_version(version.clone(), cx);
+                            })),
+                    )
+                    .child(
+                        Button::new(format!("browser-delete-{key}"))
+                            .outline()
+                            .small()
+                            .label(if pending { "确认删除" } else { "删除" })
+                            .disabled(active || self.browser_busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let key = version_for_delete.full_string();
+                                if this.browser_delete_pending.as_deref() == Some(key.as_str()) {
+                                    this.browser_delete_pending = None;
+                                    this.delete_browser_version(version_for_delete.clone(), cx);
+                                } else {
+                                    this.browser_delete_pending = Some(key);
+                                    this.browser_status = "再次点击“确认删除”移除该历史版本".into();
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            );
+        }
+        if self.browser_versions.is_empty() {
+            version_rows = version_rows.child(
+                div()
+                    .p_3()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child("尚无已安装版本"),
+            );
+        }
+        let progress = self.browser_progress.as_ref();
+        let fraction = progress.and_then(|progress| {
+            progress.total.map(|total| {
+                if total == 0 {
+                    0.
+                } else {
+                    (progress.received as f32 / total as f32).clamp(0., 1.)
+                }
+            })
+        });
+        let stage = progress
+            .map(|progress| progress.stage)
+            .unwrap_or(DownloadStage::Download);
+        let progress_title = match stage {
+            DownloadStage::Download => "正在下载",
+            DownloadStage::Verify => "正在校验",
+            DownloadStage::Install => "正在安装",
+        };
+        let progress_text = progress
+            .map(|progress| {
+                let received = progress.received as f64 / 1_048_576.;
+                match progress.total {
+                    Some(total) => format!("{received:.1} / {:.1} MB", total as f64 / 1_048_576.),
+                    None => format!("已下载 {received:.1} MB"),
+                }
+            })
+            .unwrap_or_default();
         v_flex()
             .w_full()
-            .gap_5()
+            .gap_4()
             .child(
                 div()
                     .text_2xl()
@@ -2299,30 +2679,188 @@ impl BrowserHome {
                 div()
                     .text_sm()
                     .text_color(rgb(MUTED))
-                    .child("当前设备上的数据位置与 Camoufox 安装状态"),
+                    .child("管理 Camoufox 安装与本地数据"),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_4()
+                    .items_stretch()
+                    .when(narrow, |row| row.flex_col())
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .p_5()
+                            .gap_3()
+                            .border_1()
+                            .border_color(rgb(LINE))
+                            .rounded_md()
+                            .child(
+                                div()
+                                    .font_semibold()
+                                    .text_color(rgb(INK))
+                                    .child("Camoufox 浏览器"),
+                            )
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .text_xl()
+                                            .font_semibold()
+                                            .text_color(rgb(INK))
+                                            .child(current_label),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(if current.is_some() {
+                                                GREEN
+                                            } else {
+                                                MUTED
+                                            }))
+                                            .child(if current.is_some() {
+                                                "● 已安装"
+                                            } else {
+                                                "未安装"
+                                            }),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        Button::new("browser-check-update")
+                                            .outline()
+                                            .small()
+                                            .label(if self.browser_checking {
+                                                "检查中…"
+                                            } else {
+                                                "检查更新"
+                                            })
+                                            .disabled(self.browser_checking || self.browser_busy)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.check_browser_update(cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("browser-manage-versions")
+                                            .outline()
+                                            .small()
+                                            .label(if self.browser_versions_expanded {
+                                                "收起版本"
+                                            } else {
+                                                "管理版本"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.browser_versions_expanded =
+                                                    !this.browser_versions_expanded;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div().text_xs().text_color(rgb(MUTED)).child(format!(
+                                    "安装路径  {}",
+                                    manager.active_path().display()
+                                )),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .p_5()
+                            .gap_3()
+                            .border_1()
+                            .border_color(rgb(LINE))
+                            .rounded_md()
+                            .child(div().font_semibold().text_color(rgb(INK)).child("可用更新"))
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .text_xl()
+                                            .font_semibold()
+                                            .text_color(rgb(INK))
+                                            .child(latest_label),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        Button::new("browser-download-install")
+                                            .primary()
+                                            .small()
+                                            .label(if self.browser_busy {
+                                                "安装中…"
+                                            } else {
+                                                "下载并安装"
+                                            })
+                                            .disabled(
+                                                !has_update
+                                                    || self.browser_busy
+                                                    || self.browser_checking,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.start_browser_download(cx)
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child("来源：Camoufox 官方发布 · 适配当前系统"),
+                            ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .py_2()
+                    .child(
+                        Checkbox::new("browser-download-global-proxy")
+                            .checked(self.browser_download_settings.use_global_proxy)
+                            .disabled(self.browser_busy || self.browser_checking)
+                            .accessibility_label("使用全局代理下载与更新浏览器")
+                            .on_click(move |checked, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    let settings = BrowserDownloadSettings {
+                                        use_global_proxy: *checked,
+                                    };
+                                    match settings.save(this.service.data_dir()) {
+                                        Ok(()) => {
+                                            this.browser_download_settings = settings;
+                                            this.browser_latest = None;
+                                            this.browser_status =
+                                                "下载网络设置已自动保存，请重新检查更新".into();
+                                        }
+                                        Err(error) => {
+                                            this.browser_status = format!("保存失败：{error}")
+                                        }
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(rgb(INK))
+                            .child("使用全局代理下载与更新浏览器"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("勾选后，版本检查、下载与更新使用常规设置中的全局代理。"),
+                    ),
             )
             .child(
                 v_flex()
-                    .p_5()
-                    .gap_4()
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .rounded_md()
-                    .child(div().font_semibold().text_color(rgb(INK)).child("本地数据"))
-                    .child(data_location("数据目录", root.display().to_string()))
-                    .child(data_location(
-                        "SQLite 数据库",
-                        root.join("browser.sqlite").display().to_string(),
-                    ))
-                    .child(data_location(
-                        "浏览器空间",
-                        root.join("profiles").display().to_string(),
-                    )),
-            )
-            .child(
-                v_flex()
-                    .p_5()
-                    .gap_4()
+                    .w_full()
+                    .p_4()
+                    .gap_3()
                     .border_1()
                     .border_color(rgb(LINE))
                     .rounded_md()
@@ -2330,17 +2868,124 @@ impl BrowserHome {
                         div()
                             .font_semibold()
                             .text_color(rgb(INK))
-                            .child("Camoufox 浏览器"),
+                            .child("已安装版本"),
                     )
-                    .child(data_location("安装目录", browser.display().to_string()))
-                    .child(data_location(
-                        "状态",
-                        if browser.join("version.json").exists() {
-                            "已安装"
+                    .when(self.browser_versions_expanded, |container| {
+                        container.child(version_rows)
+                    }),
+            )
+            .when(self.browser_busy, |container| {
+                container.child(
+                    v_flex()
+                        .w_full()
+                        .p_4()
+                        .gap_3()
+                        .border_1()
+                        .border_color(rgb(LINE))
+                        .rounded_md()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .font_semibold()
+                                        .text_color(rgb(INK))
+                                        .child(progress_title),
+                                )
+                                .child(div().flex_1())
+                                .child(div().text_sm().text_color(rgb(MUTED)).child(progress_text))
+                                .child(
+                                    Button::new("browser-pause-download")
+                                        .outline()
+                                        .small()
+                                        .label(
+                                            if self
+                                                .browser_control
+                                                .as_ref()
+                                                .is_some_and(DownloadControl::is_paused)
+                                            {
+                                                "继续"
+                                            } else {
+                                                "暂停"
+                                            },
+                                        )
+                                        .disabled(stage != DownloadStage::Download)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(control) = &this.browser_control {
+                                                control.pause(!control.is_paused());
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("browser-cancel-download")
+                                        .outline()
+                                        .small()
+                                        .label("取消")
+                                        .disabled(stage != DownloadStage::Download)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(control) = &this.browser_control {
+                                                control.cancel();
+                                                this.browser_status = "正在取消下载…".into();
+                                            }
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div().w_full().h(px(9.)).rounded_full().bg(rgb(LINE)).child(
+                                div()
+                                    .w(relative(fraction.unwrap_or(0.)))
+                                    .h_full()
+                                    .rounded_full()
+                                    .bg(rgb(GREEN)),
+                            ),
+                        )
+                        .child(
+                            div().text_xs().text_color(rgb(MUTED)).child(format!(
+                                "下载  →  校验  →  安装     当前：{progress_title}"
+                            )),
+                        ),
+                )
+            })
+            .when(!self.browser_status.is_empty(), |container| {
+                container.child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(if self.browser_status.contains("失败") {
+                            RED
                         } else {
-                            "尚未安装，可运行 browserctl-rs fetch"
-                        }
-                        .to_string(),
+                            GREEN
+                        }))
+                        .child(self.browser_status.clone()),
+                )
+            })
+            .child(
+                v_flex()
+                    .p_5()
+                    .gap_3()
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .rounded_md()
+                    .child(div().font_semibold().text_color(rgb(INK)).child("本地数据"))
+                    .child(data_location(
+                        "SQLite 数据库",
+                        self.paths.database(),
+                        true,
+                        cx,
+                    ))
+                    .child(data_location(
+                        "浏览器用户数据",
+                        self.paths.profiles(),
+                        false,
+                        cx,
+                    ))
+                    .child(data_location(
+                        "浏览器安装目录",
+                        manager.active_path(),
+                        false,
+                        cx,
                     )),
             )
             .into_any_element()
@@ -2354,7 +2999,10 @@ impl BrowserHome {
                 self.render_managed_settings(width < 1300., cx)
             }
             SettingsTab::Tags => self.render_tag_settings(cx),
-            SettingsTab::Data => self.render_data_settings(),
+            SettingsTab::Data => {
+                let width: f32 = window.bounds().size.width.into();
+                self.render_data_settings(width < 1320., cx)
+            }
         };
         h_flex()
             .flex_1()
@@ -3583,7 +4231,17 @@ fn settings_field(label: &'static str, input: &Entity<InputState>) -> AnyElement
         .into_any_element()
 }
 
-fn data_location(label: &'static str, value: String) -> AnyElement {
+fn data_location(
+    label: &'static str,
+    path: PathBuf,
+    open_parent: bool,
+    cx: &mut Context<BrowserHome>,
+) -> AnyElement {
+    let target = if open_parent {
+        path.parent().unwrap_or(path.as_path()).to_path_buf()
+    } else {
+        path.clone()
+    };
     h_flex()
         .items_center()
         .gap_3()
@@ -3594,7 +4252,33 @@ fn data_location(label: &'static str, value: String) -> AnyElement {
                 .text_color(rgb(MUTED))
                 .child(label),
         )
-        .child(div().text_sm().text_color(rgb(INK)).child(value))
+        .child(
+            div()
+                .flex_1()
+                .text_sm()
+                .text_color(rgb(INK))
+                .child(path.display().to_string()),
+        )
+        .child(
+            Button::new(format!("open-data-location-{label}"))
+                .outline()
+                .small()
+                .label("打开目录")
+                .disabled(!target.is_dir())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let command = if cfg!(target_os = "macos") {
+                        "open"
+                    } else if cfg!(target_os = "windows") {
+                        "explorer"
+                    } else {
+                        "xdg-open"
+                    };
+                    if let Err(error) = ProcessCommand::new(command).arg(&target).spawn() {
+                        this.browser_status = format!("无法打开目录：{error}");
+                        cx.notify();
+                    }
+                })),
+        )
         .into_any_element()
 }
 

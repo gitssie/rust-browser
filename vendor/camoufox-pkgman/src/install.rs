@@ -125,6 +125,15 @@ impl CamoufoxFetcher {
 
     /// Finds the latest supported release asset for the current platform.
     pub async fn latest_asset(&self) -> Result<(CamoufoxVersion, String)> {
+        self.latest_asset_with_proxy(None, false).await
+    }
+
+    /// Finds the latest supported release with explicit network routing.
+    pub async fn latest_asset_with_proxy(
+        &self,
+        proxy_url: Option<&str>,
+        direct: bool,
+    ) -> Result<(CamoufoxVersion, String)> {
         let os = host_os();
         let arch = platform_arch()?;
         let pattern = regex::Regex::new(&format!(
@@ -136,7 +145,7 @@ impl CamoufoxFetcher {
 
         let downloader = GitHubDownloader::new(Self::REPO);
         let asset = downloader
-            .get_asset(
+            .get_asset_with_proxy(
                 |asset| {
                     let captures = pattern.captures(&asset.name)?;
                     let version = CamoufoxVersion::new(
@@ -149,6 +158,8 @@ impl CamoufoxFetcher {
                     Some((version, asset.browser_download_url.clone()))
                 },
                 5,
+                proxy_url,
+                direct,
             )
             .await
             .map_err(|e| match e {
@@ -231,7 +242,7 @@ impl CamoufoxFetcher {
 
 /// `chmod -R 755` equivalent (POSIX only).
 #[cfg(unix)]
-fn make_executable(dir: &Path) -> Result<()> {
+pub fn make_executable(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     for entry in walkdir::WalkDir::new(dir) {
         let entry = entry.map_err(|e| CamoufoxError::Io(e.to_string()))?;
@@ -246,7 +257,7 @@ fn make_executable(dir: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn make_executable(_dir: &Path) -> Result<()> {
+pub fn make_executable(_dir: &Path) -> Result<()> {
     Ok(())
 }
 

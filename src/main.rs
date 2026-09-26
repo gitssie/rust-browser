@@ -11,10 +11,6 @@ use camoufox_core::fingerprint::determine_ua_os;
 use camoufox_core::os::SupportedOs;
 use camoufox_core::persona::PersonaRecord;
 use camoufox_juggler::{JugglerBrowser, launch_with_juggler, verify_fingerprint};
-use camoufox_pkgman::{
-    CamoufoxFetcher, install_dir, installed_ver_str, launch_path, set_install_dir,
-};
-use camoufox_store::PersonaStore;
 use clap::{Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
 use regex::Regex;
@@ -22,8 +18,12 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use url::Url;
 
+use rust_browser::browser_manager::{
+    ActiveInstallation, BrowserManager, DownloadControl, DownloadStage,
+};
 use rust_browser::geo::ProfileGeo;
 use rust_browser::launch_progress::{LaunchEvent, LaunchProgressWriter, LaunchStage};
+use rust_browser::paths::AppPaths as Paths;
 use rust_browser::profiles::{CreateProfile, ProfileOs, ProfileService, ProxyChoice};
 use rust_browser::proxy::ProxySettings;
 use rust_browser::proxy_management::{
@@ -31,7 +31,7 @@ use rust_browser::proxy_management::{
     prepare_browser_launch_with_progress,
 };
 use rust_browser::runtime::BrowserRuntime;
-use rust_browser::settings::GeneralSettings;
+use rust_browser::settings::{BrowserDownloadSettings, GeneralSettings};
 use rust_browser::storage;
 
 mod ui;
@@ -265,43 +265,6 @@ impl BrowserOs {
     }
 }
 
-#[derive(Clone)]
-struct Paths {
-    root: PathBuf,
-}
-
-impl Paths {
-    fn new(override_dir: Option<PathBuf>) -> Result<Self> {
-        let root = match override_dir {
-            Some(path) => path,
-            None => directories::ProjectDirs::from("io", "cazer", "rust-browser")
-                .context("could not determine a platform data directory")?
-                .data_dir()
-                .to_path_buf(),
-        };
-        fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
-        let root = root.canonicalize()?;
-        storage::open_store(&root)?;
-        Ok(Self { root })
-    }
-
-    fn browser(&self) -> PathBuf {
-        self.root.join("browser")
-    }
-    fn database(&self) -> PathBuf {
-        storage::database_path(&self.root)
-    }
-    fn profile(&self, id: &str) -> PathBuf {
-        self.root.join("profiles").join(id)
-    }
-    fn lock(&self, id: &str) -> PathBuf {
-        self.root.join("locks").join(format!("{id}.lock"))
-    }
-    fn store(&self) -> Result<PersonaStore> {
-        storage::open_store(&self.root)
-    }
-}
-
 fn validate_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 64
@@ -376,44 +339,16 @@ fn persona_os(persona: &PersonaRecord) -> Result<SupportedOs> {
 }
 
 fn profile_lock(paths: &Paths, id: &str) -> Result<File> {
-    fs::create_dir_all(paths.root.join("locks"))?;
+    fs::create_dir_all(paths.locks())?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(paths.lock(id))?;
+        .open(paths.profile_lock(id))?;
     lock.try_lock_exclusive()
         .with_context(|| format!("profile {id} is already open"))?;
     Ok(lock)
-}
-
-fn prepare_browser_files(paths: &Paths) -> Result<()> {
-    let root = paths.browser();
-    if !root.join("version.json").exists() {
-        bail!(
-            "Camoufox is not installed in {}; run `browserctl-rs fetch`",
-            root.display()
-        );
-    }
-    // camoufox-rust 0.9.1 validates properties at install_root/properties.json,
-    // while the macOS archive places them inside the app bundle Resources.
-    #[cfg(target_os = "macos")]
-    {
-        let source = root.join("Camoufox.app/Contents/Resources/properties.json");
-        if !source.exists() {
-            bail!("missing Camoufox properties at {}", source.display());
-        }
-        for target in [
-            root.join("properties.json"),
-            root.join("Camoufox.app/Contents/MacOS/properties.json"),
-        ] {
-            if !target.exists() || fs::read(&source)? != fs::read(&target)? {
-                fs::copy(&source, &target)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn profile_proxy(
@@ -437,7 +372,7 @@ async fn create(
     proxy_override: Option<&str>,
     global_proxy: &ProxySettings,
 ) -> Result<()> {
-    let service = ProfileService::with_proxy(&paths.root, global_proxy.clone())?;
+    let service = ProfileService::with_proxy(paths.root(), global_proxy.clone())?;
     let view = service
         .create(CreateProfile {
             id: id.to_string(),
@@ -480,8 +415,8 @@ async fn open(
 ) -> Result<()> {
     validate_id(id)?;
     let _lock = profile_lock(paths, id)?;
-    let mut persona = paths.store()?.require(id).await?;
-    let proxy = profile_proxy(&paths.root, &persona, global_proxy)?;
+    let mut persona = storage::open_store(paths.root())?.require(id).await?;
+    let proxy = profile_proxy(paths.root(), &persona, global_proxy)?;
     let targets = match url {
         Some(value) => vec![validate_url(value)?],
         None => startup_tabs(&persona)?,
@@ -497,7 +432,7 @@ async fn open(
     let proxy_guard =
         if persona.metadata.get("proxy_mode").and_then(Value::as_str) == Some("custom") {
             prepare_browser_launch_with_progress(
-                &paths.root,
+                paths.root(),
                 id,
                 &proxy,
                 &global_proxy.browser_url(),
@@ -513,14 +448,17 @@ async fn open(
     })
     .await?;
     progress.stage(LaunchStage::StartBrowser, None)?;
-    prepare_browser_files(paths)?;
+    let browser_manager = BrowserManager::new(paths.root());
+    let _browser_guard = browser_manager.runtime_guard()?;
+    let installation = browser_manager.prepare_active()?;
     println!(
         "Opening {id} via {}: {}",
         proxy.browser_url(),
         targets.join(", ")
     );
-    let options = pinned_launch_options(paths, id, &mut persona, &saved_geo, &proxy).await?;
-    let runtime_listener = BrowserRuntime::new(&paths.root).bind(id).await?;
+    let options =
+        pinned_launch_options(paths, id, &mut persona, &saved_geo, &proxy, &installation).await?;
+    let runtime_listener = BrowserRuntime::new(paths.root()).bind(id).await?;
     let mut browser = launch_with_juggler(&options).await?;
     drop(proxy_guard);
     let run = tokio::select! {
@@ -579,11 +517,12 @@ async fn close_browser(browser: &mut JugglerBrowser) -> Result<()> {
     Ok(())
 }
 
-async fn launch_options(
+fn launch_options(
     paths: &Paths,
     id: &str,
     persona: PersonaRecord,
     proxy: &ProxySettings,
+    installation: &ActiveInstallation,
 ) -> Result<LaunchOptions> {
     let mut options = LaunchOptions {
         os: vec![persona_os(&persona)?],
@@ -605,7 +544,17 @@ async fn launch_options(
         enable_cache: true,
         headless: HeadlessMode::Off,
         // macOS's Resources/../MacOS path must be normalized for XPCOM loading.
-        executable_path: Some(launch_path().await?.canonicalize()?),
+        executable_path: Some(installation.executable_path.clone()),
+        install_root: Some(installation.root.clone()),
+        ff_version: Some(
+            installation
+                .version
+                .full_string()
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        ),
         ..Default::default()
     };
     // Apply proxy prefs before Firefox's startup networking; Juggler then
@@ -627,11 +576,12 @@ async fn pinned_launch_options(
     persona: &mut PersonaRecord,
     geo: &ProfileGeo,
     proxy: &ProxySettings,
+    installation: &ActiveInstallation,
 ) -> Result<LaunchOptions> {
-    let mut options = launch_options(paths, id, persona.clone(), proxy).await?;
+    let mut options = launch_options(paths, id, persona.clone(), proxy, installation)?;
     if let Some(value) = persona.metadata.get("pinned_launch") {
         let pinned_version = metadata_str(persona, "pinned_browser_version")?;
-        if pinned_version != installed_ver_str()? {
+        if pinned_version != installation.version.full_string() {
             bail!(
                 "Camoufox version changed; this pinned identity needs a compatible browser installation"
             );
@@ -656,10 +606,11 @@ async fn pinned_launch_options(
         persona
             .metadata
             .insert("pinned_launch".into(), serde_json::to_value(&prepared)?);
-        persona
-            .metadata
-            .insert("pinned_browser_version".into(), json!(installed_ver_str()?));
-        paths.store()?.save(persona).await?;
+        persona.metadata.insert(
+            "pinned_browser_version".into(),
+            json!(installation.version.full_string()),
+        );
+        storage::open_store(paths.root())?.save(persona).await?;
         options.prepared_override = Some(prepared);
         println!(
             "Pinned launch identity for {id} in {} / {}",
@@ -722,7 +673,7 @@ async fn checked_location_with_progress(
     Ok((saved, current))
 }
 
-fn update_launch_geo(prepared: &mut PreparedLaunch, geo: &ProfileGeo) -> Result<()> {
+fn update_launch_geo(paths: &Paths, prepared: &mut PreparedLaunch, geo: &ProfileGeo) -> Result<()> {
     for key in [
         "geolocation:latitude",
         "geolocation:longitude",
@@ -750,7 +701,7 @@ fn update_launch_geo(prepared: &mut PreparedLaunch, geo: &ProfileGeo) -> Result<
     prepared.env.extend(get_env_vars(
         &prepared.config,
         target_os,
-        Some(&install_dir()),
+        Some(&paths.browser()),
     )?);
     Ok(())
 }
@@ -758,13 +709,13 @@ fn update_launch_geo(prepared: &mut PreparedLaunch, geo: &ProfileGeo) -> Result<
 async fn refresh(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Result<()> {
     validate_id(id)?;
     let _lock = profile_lock(paths, id)?;
-    let mut persona = paths.store()?.require(id).await?;
-    let proxy = profile_proxy(&paths.root, &persona, global_proxy)?;
+    let mut persona = storage::open_store(paths.root())?.require(id).await?;
+    let proxy = profile_proxy(paths.root(), &persona, global_proxy)?;
     proxy.check().await?;
     let geo = ProfileGeo::lookup(&proxy).await?;
     if let Some(value) = persona.metadata.get("pinned_launch") {
         let mut prepared: PreparedLaunch = serde_json::from_value(value.clone())?;
-        update_launch_geo(&mut prepared, &geo)?;
+        update_launch_geo(paths, &mut prepared, &geo)?;
         prepared.proxy = Some(proxy.browser_url());
         persona
             .metadata
@@ -775,7 +726,7 @@ async fn refresh(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Resul
         .insert("geo".into(), serde_json::to_value(&geo)?);
     persona.metadata.remove("pinned_proxy_ip");
     persona.metadata.remove("browserscan_baseline");
-    paths.store()?.save(&persona).await?;
+    storage::open_store(paths.root())?.save(&persona).await?;
     println!(
         "Refreshed {id}: {} | {} | {} | {}",
         geo.ip,
@@ -789,7 +740,7 @@ async fn refresh(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Resul
 async fn set_tabs(paths: &Paths, id: &str, urls: &[String], clear: bool) -> Result<()> {
     validate_id(id)?;
     let _lock = profile_lock(paths, id)?;
-    let store = paths.store()?;
+    let store = storage::open_store(paths.root())?;
     let mut persona = store.require(id).await?;
     if clear || !urls.is_empty() {
         let tabs = if clear {
@@ -822,7 +773,7 @@ async fn delete(paths: &Paths, id: &str, yes: bool, global_proxy: &ProxySettings
             bail!("deletion cancelled");
         }
     }
-    ProfileService::with_proxy(&paths.root, global_proxy.clone())?
+    ProfileService::with_proxy(paths.root(), global_proxy.clone())?
         .delete(id)
         .await?;
     println!("Deleted {id}");
@@ -832,13 +783,13 @@ async fn delete(paths: &Paths, id: &str, yes: bool, global_proxy: &ProxySettings
 async fn scan(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Result<()> {
     validate_id(id)?;
     let _lock = profile_lock(paths, id)?;
-    let mut persona = paths.store()?.require(id).await?;
-    let proxy = profile_proxy(&paths.root, &persona, global_proxy)?;
+    let mut persona = storage::open_store(paths.root())?.require(id).await?;
+    let proxy = profile_proxy(paths.root(), &persona, global_proxy)?;
     proxy.check().await?;
     let proxy_guard =
         if persona.metadata.get("proxy_mode").and_then(Value::as_str) == Some("custom") {
             prepare_browser_launch_with_progress(
-                &paths.root,
+                paths.root(),
                 id,
                 &proxy,
                 &global_proxy.browser_url(),
@@ -850,21 +801,25 @@ async fn scan(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Result<(
         };
     let (saved_geo, current_geo) = checked_location(&persona, id, &proxy).await?;
     let expected_ip = current_geo.ip;
-    prepare_browser_files(paths)?;
-    let options = pinned_launch_options(paths, id, &mut persona, &saved_geo, &proxy).await?;
-    let runtime_listener = BrowserRuntime::new(&paths.root).bind(id).await?;
+    let browser_manager = BrowserManager::new(paths.root());
+    let _browser_guard = browser_manager.runtime_guard()?;
+    let installation = browser_manager.prepare_active()?;
+    let options =
+        pinned_launch_options(paths, id, &mut persona, &saved_geo, &proxy, &installation).await?;
+    let runtime_listener = BrowserRuntime::new(paths.root()).bind(id).await?;
     let mut browser = launch_with_juggler(&options).await?;
     drop(proxy_guard);
     let result: Result<()> = tokio::select! {
         result = async {
         let page = browser.new_page().await?;
         page.goto(BROWSERSCAN_URL).await?;
-        let artifacts = paths.root.join("artifacts");
+        let artifacts = paths.artifacts();
         fs::create_dir_all(&artifacts)?;
-        let screenshot = artifacts.join(format!("{id}-browserscan.png"));
-        let report_file = artifacts.join(format!("{id}-browserscan.txt"));
-        let verification_file = artifacts.join(format!("{id}-fingerprint.json"));
-        let fields_file = artifacts.join(format!("{id}-browserscan-fields.json"));
+        let scan_files = paths.scan_artifacts(id);
+        let screenshot = scan_files.screenshot;
+        let report_file = scan_files.report;
+        let verification_file = scan_files.verification;
+        let fields_file = scan_files.fields;
         let ip_pattern = Regex::new(r"(?m)^IP\s*\n([0-9a-fA-F:.]+)\s*(?:\(|\n)")?;
         let mut report = String::new();
         let mut observed_ip = None;
@@ -960,21 +915,56 @@ async fn scan(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Result<(
 
 async fn run(cli: Cli) -> Result<()> {
     let paths = Paths::new(cli.data_dir)?;
+    storage::open_store(paths.root())?;
     let global_proxy = if matches!(&cli.command, Command::Ui) {
-        GeneralSettings::load(&paths.root)?.proxy()?
+        GeneralSettings::load(paths.root())?.proxy()?
     } else {
         match cli.global_proxy {
             Some(value) => ProxySettings::parse(&value)?,
-            None => GeneralSettings::load(&paths.root)?.proxy()?,
+            None => GeneralSettings::load(paths.root())?.proxy()?,
         }
     };
-    // Separate this installation from the Python Camoufox environment.
-    set_install_dir(Some(paths.browser()));
     match cli.command {
         Command::Fetch => {
-            CamoufoxFetcher::new().install().await?;
-            prepare_browser_files(&paths)?;
-            println!("Installed Camoufox in {}", install_dir().display());
+            let manager = BrowserManager::new(paths.root());
+            let proxy = if BrowserDownloadSettings::load(paths.root())?.use_global_proxy {
+                Some(GeneralSettings::load(paths.root())?.proxy()?)
+            } else {
+                None
+            };
+            let release = manager.latest(proxy.as_ref()).await?;
+            let versions = manager.installed_versions()?;
+            if versions
+                .iter()
+                .any(|item| item.active && item.version == release.version)
+            {
+                println!(
+                    "Camoufox {} is already installed",
+                    release.version.full_string()
+                );
+                return Ok(());
+            }
+            if versions
+                .iter()
+                .any(|item| !item.active && item.version == release.version)
+            {
+                manager.activate(&release.version)?;
+            } else {
+                manager
+                    .download_and_install(
+                        &release,
+                        proxy.as_ref(),
+                        &DownloadControl::default(),
+                        |progress| {
+                            if progress.received == 0 || progress.stage != DownloadStage::Download {
+                                println!("Browser install: {:?}", progress.stage);
+                            }
+                        },
+                    )
+                    .await?;
+            }
+            manager.prepare_active()?;
+            println!("Installed Camoufox in {}", manager.active_path().display());
         }
         Command::Create {
             id,
@@ -995,7 +985,7 @@ async fn run(cli: Cli) -> Result<()> {
             .await?
         }
         Command::List { json } => {
-            let summaries = paths.store()?.list().await?;
+            let summaries = storage::open_store(paths.root())?.list().await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&summaries)?);
             } else if summaries.is_empty() {
@@ -1008,8 +998,8 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Show { id } => {
             validate_id(&id)?;
-            let persona = paths.store()?.require(&id).await?;
-            let proxy = profile_proxy(&paths.root, &persona, &global_proxy)?;
+            let persona = storage::open_store(paths.root())?.require(&id).await?;
+            let proxy = profile_proxy(paths.root(), &persona, &global_proxy)?;
             let summary = json!({
                 "id": persona.id,
                 "name": persona.name,
@@ -1029,7 +1019,7 @@ async fn run(cli: Cli) -> Result<()> {
                 validate_id(id)?;
             }
             let details = json!({
-                "data_dir": paths.root,
+                "data_dir": paths.root(),
                 "browser_install": paths.browser(),
                 "persona_store": paths.database(),
                 "browser_data": id.map(|id| paths.profile(&id)),
@@ -1046,15 +1036,19 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Refresh { id } => refresh(&paths, &id, &global_proxy).await?,
         Command::Delete { id, yes } => delete(&paths, &id, yes, &global_proxy).await?,
         Command::Doctor => {
-            println!("Data directory: {}", paths.root.display());
-            println!("Browser directory: {}", install_dir().display());
+            println!("Data directory: {}", paths.root().display());
+            let browser_manager = BrowserManager::new(paths.root());
+            println!(
+                "Browser directory: {}",
+                browser_manager.active_path().display()
+            );
             let proxy_status = global_proxy.check().await;
             match &proxy_status {
                 Ok(()) => println!("Proxy {}: reachable", global_proxy.browser_url()),
                 Err(error) => println!("Proxy {}: {error:#}", global_proxy.browser_url()),
             }
-            if paths.browser().join("version.json").exists() {
-                println!("Browser installed: {}", installed_ver_str()?);
+            if let Some(version) = browser_manager.active_version()? {
+                println!("Browser installed: {}", version.full_string());
             } else {
                 println!("Browser: not installed; run `browserctl-rs fetch`");
             }
@@ -1062,7 +1056,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Ui => ui::run(paths, global_proxy)?,
         Command::Proxy { action } => {
-            let catalog = ProxyCatalog::new(&paths.root);
+            let catalog = ProxyCatalog::new(paths.root());
             match action {
                 ProxyAction::List => {
                     let records: Vec<_> = catalog

@@ -10,8 +10,10 @@ use anyhow::Result;
 use camoufox_store::{PersonaStore, SqliteStore};
 use rusqlite::Connection;
 
+use crate::paths::AppPaths;
+
 pub fn database_path(root: &Path) -> PathBuf {
-    root.join("browser.sqlite")
+    AppPaths::for_root(root).database()
 }
 
 pub fn open_store(root: &Path) -> Result<PersonaStore> {
