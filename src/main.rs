@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use camoufox::builder::{HeadlessMode, LaunchOptions, PreparedLaunch, ProxyConfig, prepare};
-use camoufox_core::config::get_env_vars;
+use camoufox_core::config::{WINDOW_DIM_KEYS, get_env_vars};
 use camoufox_core::fingerprint::determine_ua_os;
 use camoufox_core::os::SupportedOs;
 use camoufox_core::persona::PersonaRecord;
@@ -594,13 +594,21 @@ async fn pinned_launch_options(
             );
         }
         prepared.executable_path = saved_executable;
+        let viewport_changed = use_native_viewport(paths, &mut prepared)?;
         prepared.proxy = Some(proxy.browser_url());
         proxy.apply_firefox_prefs(&mut prepared.firefox_user_prefs);
+        if viewport_changed {
+            persona
+                .metadata
+                .insert("pinned_launch".into(), serde_json::to_value(&prepared)?);
+            storage::open_store(paths.root())?.save(persona).await?;
+        }
         options.prepared_override = Some(prepared);
     } else {
         options.geoip = None;
         options.geolocation_override = Some(geo.as_geolocation()?);
         let mut prepared = prepare(&options).await?;
+        use_native_viewport(paths, &mut prepared)?;
         // Authentication belongs to the general proxy setting. A pinned
         // fingerprint must not retain an old proxy password.
         prepared.proxy = Some(proxy.browser_url());
@@ -619,6 +627,32 @@ async fn pinned_launch_options(
         );
     }
     Ok(options)
+}
+
+/// Keep screen identity pinned while the page viewport follows native resizes.
+fn use_native_viewport(paths: &Paths, prepared: &mut PreparedLaunch) -> Result<bool> {
+    let mut changed = false;
+    for key in WINDOW_DIM_KEYS {
+        changed |= prepared.config.remove(*key).is_some();
+    }
+    prepared.spoofs_window_dimensions = false;
+    if changed {
+        let user_agent = prepared
+            .config
+            .get("navigator.userAgent")
+            .and_then(Value::as_str)
+            .context("saved launch has no user agent")?;
+        let target_os = determine_ua_os(user_agent)?;
+        prepared
+            .env
+            .retain(|key, _| !key.starts_with("CAMOU_CONFIG_"));
+        prepared.env.extend(get_env_vars(
+            &prepared.config,
+            target_os,
+            Some(&paths.browser()),
+        )?);
+    }
+    Ok(changed)
 }
 
 async fn checked_location(
@@ -717,6 +751,7 @@ async fn refresh(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Resul
     if let Some(value) = persona.metadata.get("pinned_launch") {
         let mut prepared: PreparedLaunch = serde_json::from_value(value.clone())?;
         update_launch_geo(paths, &mut prepared, &geo)?;
+        use_native_viewport(paths, &mut prepared)?;
         prepared.proxy = Some(proxy.browser_url());
         persona
             .metadata
@@ -1135,6 +1170,46 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use rust_browser::launch_progress::read_events;
+
+    #[test]
+    fn native_viewport_keeps_screen_identity_but_removes_fixed_window_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let mut config = camoufox_core::config::ConfigMap::new();
+        config.insert(
+            "navigator.userAgent".into(),
+            json!(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
+            ),
+        );
+        config.insert("screen.width".into(), json!(1920));
+        config.insert("window.innerWidth".into(), json!(1280));
+        config.insert("window.outerWidth".into(), json!(1300));
+        let mut prepared = PreparedLaunch {
+            executable_path: paths.browser().join("camoufox.exe"),
+            env: BTreeMap::from([(
+                "CAMOU_CONFIG_1".into(),
+                serde_json::to_string(&config).unwrap(),
+            )]),
+            firefox_user_prefs: BTreeMap::new(),
+            args: Vec::new(),
+            proxy: None,
+            proxy_bypass: None,
+            spoofs_window_dimensions: true,
+            config,
+        };
+        assert!(use_native_viewport(&paths, &mut prepared).unwrap());
+        assert!(!prepared.spoofs_window_dimensions);
+        assert_eq!(prepared.config.get("screen.width"), Some(&json!(1920)));
+        for key in WINDOW_DIM_KEYS {
+            assert!(!prepared.config.contains_key(*key));
+        }
+        let encoded: serde_json::Value =
+            serde_json::from_str(&prepared.env["CAMOU_CONFIG_1"]).unwrap();
+        assert_eq!(encoded["screen.width"], 1920);
+        assert!(encoded.get("window.innerWidth").is_none());
+        assert!(!use_native_viewport(&paths, &mut prepared).unwrap());
+    }
 
     #[test]
     fn create_command_does_not_accept_a_profile_id() {

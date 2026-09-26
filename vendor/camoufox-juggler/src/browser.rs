@@ -375,13 +375,17 @@ impl JugglerBrowser {
         };
 
         let page_events = self.connection.subscribe(&session_id);
-        Ok(JugglerPage::new(
+        let page = JugglerPage::new(
             self.connection.clone(),
             session_id,
             target_id,
             browser_context_id,
             page_events,
-        ))
+        );
+        // Mirror Playwright's no_viewport=True: a fixed viewport keeps page
+        // layout frozen when the user resizes the native browser window.
+        page.reset_viewport().await?;
+        Ok(page)
     }
 
     /// Gracefully closes the browser and reaps the process.
