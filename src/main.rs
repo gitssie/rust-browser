@@ -130,7 +130,6 @@ enum Command {
     Fetch,
     /// Create and persist a fingerprint identity.
     Create {
-        id: String,
         /// Proxy for this profile instead of the global proxy.
         #[arg(long)]
         proxy: Option<String>,
@@ -367,7 +366,6 @@ fn profile_proxy(
 
 async fn create(
     paths: &Paths,
-    id: &str,
     os: BrowserOs,
     url: Option<&str>,
     tabs: &[String],
@@ -376,27 +374,26 @@ async fn create(
 ) -> Result<()> {
     let service = ProfileService::with_proxy(paths.root(), global_proxy.clone())?;
     let view = service
-        .create(CreateProfile {
-            id: id.to_string(),
-            name: None,
-            os: match os {
+        .create(CreateProfile::new(
+            None,
+            match os {
                 BrowserOs::Macos => ProfileOs::Macos,
                 BrowserOs::Windows => ProfileOs::Windows,
                 BrowserOs::Linux => ProfileOs::Linux,
             },
-            tabs: if tabs.is_empty() {
+            if tabs.is_empty() {
                 url.map(|value| vec![value.to_string()]).unwrap_or_default()
             } else {
                 tabs.to_vec()
             },
-            proxy: match proxy_override {
+            match proxy_override {
                 Some(proxy) => ProxyChoice::Custom(proxy.to_string()),
                 None => ProxyChoice::Global,
             },
-            geo: None,
-        })
+            None,
+        ))
         .await?;
-    println!("Created {id} ({})", os.as_str());
+    println!("Created {} ({})", view.id, os.as_str());
     println!(
         "Saved location: {} | {} | {} | {}",
         view.saved_geo.ip,
@@ -973,7 +970,6 @@ async fn run(cli: Cli) -> Result<()> {
             println!("Installed Camoufox in {}", manager.active_path().display());
         }
         Command::Create {
-            id,
             proxy,
             os,
             url,
@@ -981,7 +977,6 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             create(
                 &paths,
-                &id,
                 os,
                 url.as_deref(),
                 &tabs,
@@ -995,7 +990,7 @@ async fn run(cli: Cli) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&summaries)?);
             } else if summaries.is_empty() {
-                println!("No profiles. Create one with: browserctl-rs create NAME");
+                println!("No profiles. Create one with: browserctl-rs create");
             } else {
                 for item in summaries {
                     println!("{:<24} {}", item.id, item.user_agent);
@@ -1140,6 +1135,12 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use rust_browser::launch_progress::read_events;
+
+    #[test]
+    fn create_command_does_not_accept_a_profile_id() {
+        assert!(Cli::try_parse_from(["browserctl-rs", "create"]).is_ok());
+        assert!(Cli::try_parse_from(["browserctl-rs", "create", "manual-id"]).is_err());
+    }
 
     #[tokio::test]
     async fn open_failure_is_reported_to_native_ui() {

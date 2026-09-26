@@ -273,7 +273,6 @@ struct BrowserHome {
     managed_generation: u64,
     managed_delete_pending: bool,
     search: Entity<InputState>,
-    form_id: Entity<InputState>,
     form_name: Entity<InputState>,
     form_url: Entity<InputState>,
     form_proxy: Entity<InputState>,
@@ -1018,7 +1017,6 @@ impl BrowserHome {
             workspace_lock,
         } = initial_settings;
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索名称或 ID"));
-        let form_id = cx.new(|cx| InputState::new(window, cx).placeholder("例如 vinted-fr-01"));
         let form_name = cx.new(|cx| InputState::new(window, cx).placeholder("显示名称"));
         let form_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://www.vinted.fr/"));
@@ -1180,7 +1178,6 @@ impl BrowserHome {
             managed_generation: 0,
             managed_delete_pending: false,
             search,
-            form_id,
             form_name,
             form_url,
             form_proxy,
@@ -1582,7 +1579,6 @@ impl BrowserHome {
         self.geo_error.clear();
         self.geo_generation += 1;
         for input in [
-            &self.form_id,
             &self.form_name,
             &self.form_url,
             &self.form_proxy,
@@ -1606,8 +1602,6 @@ impl BrowserHome {
         let Some(profile) = self.rows.iter().find(|row| row.id == id) else {
             return;
         };
-        self.form_id
-            .update(cx, |input, cx| input.set_value(&profile.id, window, cx));
         self.form_name.update(cx, |input, cx| {
             input.set_value(profile.name.as_deref().unwrap_or(""), window, cx)
         });
@@ -1715,7 +1709,6 @@ impl BrowserHome {
         if self.busy {
             return;
         }
-        let id = self.form_id.read(cx).value().trim().to_string();
         let name = self.form_name.read(cx).value().trim().to_string();
         let url = self.form_url.read(cx).value().trim().to_string();
         let proxy = self.form_proxy.read(cx).value().trim().to_string();
@@ -1756,14 +1749,13 @@ impl BrowserHome {
                         match dialog {
                             Dialog::Create => {
                                 service
-                                    .create(CreateProfile {
-                                        id,
-                                        name: if name.is_empty() { None } else { Some(name) },
+                                    .create(CreateProfile::new(
+                                        if name.is_empty() { None } else { Some(name) },
                                         os,
                                         tabs,
-                                        proxy: choice,
+                                        choice,
                                         geo,
-                                    })
+                                    ))
                                     .await
                             }
                             Dialog::Edit(id) => {
@@ -3938,7 +3930,6 @@ impl BrowserHome {
                             })),
                     ),
             )
-            .child(form_field("Profile ID", &self.form_id, cx))
             .child(form_field("名称", &self.form_name, cx))
             .child(form_field("启动页面", &self.form_url, cx))
             .child(

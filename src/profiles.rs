@@ -66,7 +66,9 @@ pub enum ProxyChoice {
 
 #[derive(Clone, Debug)]
 pub struct CreateProfile {
-    pub id: String,
+    // Only the service assigns IDs for new profiles. Tests can set this to
+    // exercise existing profile records and validation paths.
+    id: Option<String>,
     pub name: Option<String>,
     pub os: ProfileOs,
     pub tabs: Vec<String>,
@@ -74,6 +76,25 @@ pub struct CreateProfile {
     /// None uses the proxy's detected GeoIP. Some overrides editable fields
     /// while keeping the observed proxy IP and enforcing exit-region identity.
     pub geo: Option<ProfileGeoInput>,
+}
+
+impl CreateProfile {
+    pub fn new(
+        name: Option<String>,
+        os: ProfileOs,
+        tabs: Vec<String>,
+        proxy: ProxyChoice,
+        geo: Option<ProfileGeoInput>,
+    ) -> Self {
+        Self {
+            id: None,
+            name,
+            os,
+            tabs,
+            proxy,
+            geo,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -384,19 +405,13 @@ impl ProfileService {
     }
 
     pub async fn create(&self, input: CreateProfile) -> ProfileResult<ProfileView> {
-        validate_id(&input.id)?;
+        let explicit_id = input.id.clone();
+        if let Some(id) = explicit_id.as_deref() {
+            validate_id(id)?;
+        }
         let name = input.name.as_deref().map(validate_name).transpose()?;
         let tabs = validate_tabs(&input.tabs)?;
         let proxy = self.resolve_proxy(&input.proxy)?;
-        if self
-            .store()?
-            .load(&input.id)
-            .await
-            .map_err(storage)?
-            .is_some()
-        {
-            return Err(ProfileError::AlreadyExists(input.id));
-        }
         proxy.check().await.map_err(ProfileError::Proxy)?;
         let observed = ProfileGeo::lookup(&proxy)
             .await
@@ -405,7 +420,30 @@ impl ProfileService {
             Some(custom) => custom.apply_to(observed)?,
             None => observed,
         };
-        self.create_with_geo(input, name, tabs, geo).await
+        self.create_with_verified_geo(input, name, tabs, geo).await
+    }
+
+    async fn create_with_verified_geo(
+        &self,
+        mut input: CreateProfile,
+        name: Option<String>,
+        tabs: Vec<String>,
+        geo: ProfileGeo,
+    ) -> ProfileResult<ProfileView> {
+        let explicit_id = input.id.clone();
+        for _ in 0..16 {
+            input.id = Some(explicit_id.clone().unwrap_or_else(random_profile_id));
+            match self
+                .create_with_geo(input.clone(), name.clone(), tabs.clone(), geo.clone())
+                .await
+            {
+                Err(ProfileError::AlreadyExists(_)) if explicit_id.is_none() => continue,
+                result => return result,
+            }
+        }
+        Err(ProfileError::Storage(anyhow::anyhow!(
+            "could not allocate a unique profile ID"
+        )))
     }
 
     async fn create_with_geo(
@@ -415,18 +453,20 @@ impl ProfileService {
         tabs: Vec<String>,
         geo: ProfileGeo,
     ) -> ProfileResult<ProfileView> {
-        let _lock = self.lock(&input.id)?;
+        let id = input.id.as_deref().expect("profile ID must be assigned");
+        validate_id(id)?;
+        let _lock = self.lock(id)?;
         let store = self.store()?;
-        if store.load(&input.id).await.map_err(storage)?.is_some() {
-            return Err(ProfileError::AlreadyExists(input.id));
+        if store.load(id).await.map_err(storage)?.is_some() || self.browser_data_dir(id).exists() {
+            return Err(ProfileError::AlreadyExists(id.to_string()));
         }
         let request = FingerprintRequest {
             operating_systems: Some(vec![input.os.supported()]),
             seed: Some(rand::thread_rng().r#gen::<u64>()),
             ..Default::default()
         };
-        let mut record = PersonaRecord::generate(&input.id, &request).map_err(storage)?;
-        record.name = Some(name.unwrap_or_else(|| input.id.clone()));
+        let mut record = PersonaRecord::generate(id, &request).map_err(storage)?;
+        record.name = Some(name.unwrap_or_else(|| id.to_string()));
         record
             .metadata
             .insert("os".into(), json!(input.os.supported().as_str()));
@@ -715,6 +755,14 @@ fn validate_id(id: &str) -> ProfileResult<()> {
     Ok(())
 }
 
+fn random_profile_id() -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rngs::OsRng;
+    (0..8)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
+}
+
 fn validate_name(name: &str) -> ProfileResult<String> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 100 || name.chars().any(char::is_control) {
@@ -833,12 +881,43 @@ mod tests {
 
     fn input(id: &str, name: &str, proxy: ProxyChoice) -> CreateProfile {
         CreateProfile {
-            id: id.into(),
+            id: Some(id.into()),
             name: Some(name.into()),
             os: ProfileOs::Windows,
             tabs: vec!["https://www.vinted.fr/".into()],
             proxy,
             geo: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn new_profiles_receive_short_lowercase_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProfileService::new(dir.path(), "socks5://127.0.0.1:12334").unwrap();
+        let create = || {
+            CreateProfile::new(
+                Some("Auto".into()),
+                ProfileOs::Windows,
+                Vec::new(),
+                ProxyChoice::Global,
+                None,
+            )
+        };
+        let first = service
+            .create_with_verified_geo(create(), Some("Auto".into()), Vec::new(), geo())
+            .await
+            .unwrap();
+        let second = service
+            .create_with_verified_geo(create(), Some("Auto".into()), Vec::new(), geo())
+            .await
+            .unwrap();
+        assert_ne!(first.id, second.id);
+        for id in [&first.id, &second.id] {
+            assert_eq!(id.len(), 8);
+            assert!(
+                id.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            );
         }
     }
 

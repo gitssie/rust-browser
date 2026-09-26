@@ -11,20 +11,20 @@ process is used. This project does not read or modify `/opt/workspace/vinted-bro
 ```sh
 cargo run -- fetch
 cargo run -- ui
-cargo run -- create account-a --os windows --tab https://www.vinted.fr/
-cargo run -- --global-proxy socks5://127.0.0.1:23456 create account-b
-cargo run -- create account-c --proxy socks5://127.0.0.1:34567
+cargo run -- create --os windows --tab https://www.vinted.fr/
+cargo run -- --global-proxy socks5://127.0.0.1:23456 create
+cargo run -- create --proxy socks5://127.0.0.1:34567
 cargo run -- list
 cargo run -- list --json
-cargo run -- show account-a
-cargo run -- paths account-a
-cargo run -- tabs account-a --set https://www.vinted.fr/
+cargo run -- show PROFILE_ID
+cargo run -- paths PROFILE_ID
+cargo run -- tabs PROFILE_ID --set https://www.vinted.fr/
 cargo run -- doctor
-cargo run -- open account-a
-cargo run -- open account-a --url https://www.vinted.fr/
-cargo run -- scan account-a
-cargo run -- refresh account-a
-cargo run -- delete account-a
+cargo run -- open PROFILE_ID
+cargo run -- open PROFILE_ID --url https://www.vinted.fr/
+cargo run -- scan PROFILE_ID
+cargo run -- refresh PROFILE_ID
+cargo run -- delete PROFILE_ID
 # For non-interactive scripts only:
 cargo run -- delete account-a --yes
 ```
@@ -114,9 +114,9 @@ variation for this profile.
 
 `create --tab` and `tabs --set` accept repeated URLs. `open --url` overrides the
 saved tabs for that launch. Without saved tabs, `open` starts at `about:blank`.
-Only `scan` navigates to BrowserScan. A new
-Profile ID must contain only ASCII letters, digits, `_`, or `-` and start with
-a letter or digit. `delete` asks you to type the ID unless `--yes` is used.
+Only `scan` navigates to BrowserScan. `create` prints its generated eight-character
+lowercase letter/digit profile ID; use it as `PROFILE_ID` in later commands.
+`delete` asks you to type the ID unless `--yes` is used.
 
 ## Native profile manager
 

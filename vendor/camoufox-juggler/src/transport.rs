@@ -110,7 +110,7 @@ fn common_args_for_platform(
         // Firefox's Windows launcher can hand off to a second process and
         // exit successfully before the Juggler pipe is initialized. Keep
         // the launched process attached to its browser lifetime.
-        args.extend(["-wait-for-browser".into(), "-foreground".into()]);
+        args.push("-wait-for-browser".into());
     }
     args.extend([
         "--profile".into(),
@@ -599,7 +599,7 @@ mod tests {
             &[],
             true,
         );
-        assert_eq!(&args[0..3], ["-no-remote", "-wait-for-browser", "-foreground"]);
+        assert_eq!(&args[0..2], ["-no-remote", "-wait-for-browser"]);
         assert!(args.windows(2).any(|pair| pair == ["--profile", "profile"]));
     }
 
