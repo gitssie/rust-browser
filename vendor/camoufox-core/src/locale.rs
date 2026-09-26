@@ -282,6 +282,22 @@ pub fn from_region(region: &str) -> Result<Locale> {
     normalize_locale(&format!("{language}-{region}"))
 }
 
+/// Selects the most common language for a territory, so a saved browser
+/// location starts with a predictable locale rather than a weighted draw.
+pub fn dominant_locale(region: &str) -> Result<Locale> {
+    let territory = territory_info()
+        .territories
+        .iter()
+        .find(|territory| territory.code.eq_ignore_ascii_case(region))
+        .ok_or_else(|| CamoufoxError::UnknownTerritory(format!("Unknown territory: {region}")))?;
+    let language = territory
+        .languages
+        .iter()
+        .max_by(|a, b| a.population_percent.total_cmp(&b.population_percent))
+        .ok_or_else(|| CamoufoxError::LocaleError(format!("No language data found for region: {region}")))?;
+    normalize_locale(&format!("{}-{region}", language.language.replace('_', "-")))
+}
+
 /// `SELECTOR.fromLanguage(language)`: picks a region weighted by literate
 /// speaker population, then normalizes `language-REGION`.
 pub fn from_language(language: &str) -> Result<Locale> {

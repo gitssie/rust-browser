@@ -83,6 +83,9 @@ pub struct LaunchOptions {
     /// for a target IP.
     pub geoip: Option<Option<String>>,
 
+    /// A saved location, resolved by the caller's preferred GeoIP provider.
+    pub geolocation_override: Option<camoufox_core::locale::Geolocation>,
+
     /// Humanize the cursor movement: `Some(None)` default speed,
     /// `Some(Some(seconds))` max duration.
     pub humanize: Option<Option<f64>>,
@@ -353,7 +356,11 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
     let proxy_url = options.proxy.as_ref().map(proxy_to_url);
 
     // Geolocation via geoip.
-    if let Some(geoip) = &options.geoip {
+    if let Some(geolocation) = &options.geolocation_override {
+        for (key, value) in geolocation.as_config()? {
+            config.insert(key, value);
+        }
+    } else if let Some(geoip) = &options.geoip {
         let ip = match geoip {
             Some(ip) => ip.clone(),
             None => camoufox_geoip::public_ip(proxy_url.as_deref())

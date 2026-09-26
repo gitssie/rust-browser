@@ -1,31 +1,42 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use camoufox::builder::{HeadlessMode, LaunchOptions, PreparedLaunch, ProxyConfig, prepare};
-use camoufox_core::fingerprint::FingerprintRequest;
+use camoufox_core::config::get_env_vars;
+use camoufox_core::fingerprint::determine_ua_os;
 use camoufox_core::os::SupportedOs;
 use camoufox_core::persona::PersonaRecord;
-use camoufox_geoip::public_ip;
 use camoufox_juggler::{JugglerBrowser, launch_with_juggler, verify_fingerprint};
 use camoufox_pkgman::{
     CamoufoxFetcher, install_dir, installed_ver_str, launch_path, set_install_dir,
 };
-use camoufox_store::{FileStore, PersonaStore};
+use camoufox_store::PersonaStore;
 use clap::{Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
-use rand::Rng;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::net::TcpStream;
 use url::Url;
 
-const DEFAULT_PROXY: &str = "socks5://127.0.0.1:12334";
-const DEFAULT_URL: &str = "https://www.browserscan.net/";
+use rust_browser::geo::ProfileGeo;
+use rust_browser::launch_progress::{LaunchEvent, LaunchProgressWriter, LaunchStage};
+use rust_browser::profiles::{CreateProfile, ProfileOs, ProfileService, ProxyChoice};
+use rust_browser::proxy::ProxySettings;
+use rust_browser::proxy_management::{
+    IpSwitch, ManagedProxy, ProxyCatalog, ProxyPolicy, SwitchMethod,
+    prepare_browser_launch_with_progress,
+};
+use rust_browser::runtime::BrowserRuntime;
+use rust_browser::settings::GeneralSettings;
+use rust_browser::storage;
+
+mod ui;
+
+const BROWSERSCAN_URL: &str = "https://www.browserscan.net/";
 
 const SCAN_IDENTITY_FIELDS: &[&str] = &[
     "visitor ID",
@@ -54,7 +65,7 @@ const SCAN_IDENTITY_FIELDS: &[&str] = &[
     "WebRTC STUN",
 ];
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct ScanIdentity(BTreeMap<String, String>);
 
 impl ScanIdentity {
@@ -91,21 +102,6 @@ impl ScanIdentity {
         }
         Ok(Self(values))
     }
-
-    fn compare(&self, expected: &Self) -> Result<()> {
-        let changes: Vec<String> = expected
-            .0
-            .iter()
-            .filter_map(|(label, old)| {
-                let current = self.0.get(label);
-                (current != Some(old)).then(|| format!("{label}: {old:?} -> {current:?}"))
-            })
-            .collect();
-        if !changes.is_empty() {
-            bail!("BrowserScan fingerprint changed:\n{}", changes.join("\n"));
-        }
-        Ok(())
-    }
 }
 
 #[derive(Parser)]
@@ -118,6 +114,10 @@ struct Cli {
     #[arg(long, global = true, env = "RUST_BROWSER_DATA_DIR")]
     data_dir: Option<PathBuf>,
 
+    /// Global SOCKS5 proxy; profiles without a custom proxy follow this value.
+    #[arg(long = "global-proxy", global = true, env = "RUST_BROWSER_PROXY")]
+    global_proxy: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -129,10 +129,13 @@ enum Command {
     /// Create and persist a fingerprint identity.
     Create {
         id: String,
+        /// Proxy for this profile instead of the global proxy.
+        #[arg(long)]
+        proxy: Option<String>,
         #[arg(long, value_enum, default_value_t = BrowserOs::Macos)]
         os: BrowserOs,
-        #[arg(long, default_value = DEFAULT_URL)]
-        url: String,
+        #[arg(long)]
+        url: Option<String>,
         /// Startup URLs. Repeat to open several tabs.
         #[arg(long = "tab")]
         tabs: Vec<String>,
@@ -154,15 +157,18 @@ enum Command {
         #[arg(long)]
         clear: bool,
     },
-    /// Open a persistent, visible browser through local SOCKS5.
+    /// Open a persistent, visible browser through the profile's configured SOCKS5 proxy.
     Open {
         id: String,
         #[arg(long)]
         url: Option<String>,
+        /// Progress events for the native manager.
+        #[arg(long, hide = true)]
+        progress_file: Option<PathBuf>,
     },
     /// Capture BrowserScan plus camoufox-rust's fingerprint verification report.
     Scan { id: String },
-    /// Explicitly rotate the pinned launch identity to the current proxy exit.
+    /// Accept the current proxy location while keeping fingerprint noise seeds.
     Refresh { id: String },
     /// Permanently delete a profile and its browser data.
     Delete {
@@ -172,6 +178,70 @@ enum Command {
     },
     /// Check local proxy and browser installation without launching it.
     Doctor,
+    /// Open the native GPUI profile manager.
+    Ui,
+    /// Manage proxy-wide launch and IP switching rules.
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProxyAction {
+    /// List managed proxies.
+    List,
+    /// Create or replace one managed proxy rule.
+    Set {
+        id: String,
+        url: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_enum, default_value_t = ProxyPolicyArg::AllowParallel)]
+        policy: ProxyPolicyArg,
+        #[arg(long)]
+        switch_url: Option<String>,
+        #[arg(long, value_enum, default_value_t = SwitchMethodArg::Get)]
+        switch_method: SwitchMethodArg,
+        #[arg(long, requires = "switch_url")]
+        rotate_on_start: bool,
+        #[arg(long, default_value_t = 5)]
+        wait_seconds: u64,
+    },
+    /// Remove a managed rule; saved profiles and proxy URLs are untouched.
+    Remove { id: String },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ProxyPolicyArg {
+    AllowParallel,
+    RejectNew,
+    ClosePrevious,
+}
+
+impl From<ProxyPolicyArg> for ProxyPolicy {
+    fn from(value: ProxyPolicyArg) -> Self {
+        match value {
+            ProxyPolicyArg::AllowParallel => Self::AllowParallel,
+            ProxyPolicyArg::RejectNew => Self::RejectNew,
+            ProxyPolicyArg::ClosePrevious => Self::ClosePrevious,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SwitchMethodArg {
+    Get,
+    Post,
+}
+
+impl From<SwitchMethodArg> for SwitchMethod {
+    fn from(value: SwitchMethodArg) -> Self {
+        match value {
+            SwitchMethodArg::Get => Self::Get,
+            SwitchMethodArg::Post => Self::Post,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -210,16 +280,16 @@ impl Paths {
                 .to_path_buf(),
         };
         fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
-        Ok(Self {
-            root: root.canonicalize()?,
-        })
+        let root = root.canonicalize()?;
+        storage::open_store(&root)?;
+        Ok(Self { root })
     }
 
     fn browser(&self) -> PathBuf {
         self.root.join("browser")
     }
-    fn personas(&self) -> PathBuf {
-        self.root.join("personas")
+    fn database(&self) -> PathBuf {
+        storage::database_path(&self.root)
     }
     fn profile(&self, id: &str) -> PathBuf {
         self.root.join("profiles").join(id)
@@ -227,8 +297,8 @@ impl Paths {
     fn lock(&self, id: &str) -> PathBuf {
         self.root.join("locks").join(format!("{id}.lock"))
     }
-    fn store(&self) -> PersonaStore {
-        PersonaStore::new(Box::new(FileStore::new(self.personas())))
+    fn store(&self) -> Result<PersonaStore> {
+        storage::open_store(&self.root)
     }
 }
 
@@ -346,71 +416,120 @@ fn prepare_browser_files(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-async fn check_proxy() -> Result<()> {
-    tokio::time::timeout(
-        Duration::from_secs(3),
-        TcpStream::connect("127.0.0.1:12334"),
-    )
-    .await
-    .context("timed out connecting to local SOCKS5 proxy at 127.0.0.1:12334")?
-    .context("local SOCKS5 proxy at 127.0.0.1:12334 is unavailable")?;
-    Ok(())
-}
-
-async fn create(paths: &Paths, id: &str, os: BrowserOs, url: &str, tabs: &[String]) -> Result<()> {
-    validate_id(id)?;
-    let url = validate_url(url)?;
-    let tabs = if tabs.is_empty() {
-        vec![url]
-    } else {
-        validate_tabs(tabs)?
-    };
-    let _lock = profile_lock(paths, id)?;
-    let store = paths.store();
-    if store.load(id).await?.is_some() {
-        bail!("profile {id} already exists");
+fn profile_proxy(
+    root: &Path,
+    persona: &PersonaRecord,
+    global_proxy: &ProxySettings,
+) -> Result<ProxySettings> {
+    match persona.metadata.get("proxy_mode").and_then(Value::as_str) {
+        Some("custom") => ProxyCatalog::new(root).resolve_url(metadata_str(persona, "proxy_url")?),
+        Some("global") | None => Ok(global_proxy.clone()),
+        Some(other) => bail!("invalid proxy mode: {other}"),
     }
-    let request = FingerprintRequest {
-        operating_systems: Some(vec![os.supported()]),
-        seed: Some(rand::thread_rng().r#gen::<u64>()),
-        ..Default::default()
-    };
-    let mut persona = PersonaRecord::generate(id, &request)?;
-    persona.name = Some(id.to_string());
-    persona.metadata.insert("os".into(), json!(os.as_str()));
-    persona.metadata.insert("tabs".into(), json!(tabs));
-    store.save(&persona).await?;
+}
+
+async fn create(
+    paths: &Paths,
+    id: &str,
+    os: BrowserOs,
+    url: Option<&str>,
+    tabs: &[String],
+    proxy_override: Option<&str>,
+    global_proxy: &ProxySettings,
+) -> Result<()> {
+    let service = ProfileService::with_proxy(&paths.root, global_proxy.clone())?;
+    let view = service
+        .create(CreateProfile {
+            id: id.to_string(),
+            name: None,
+            os: match os {
+                BrowserOs::Macos => ProfileOs::Macos,
+                BrowserOs::Windows => ProfileOs::Windows,
+                BrowserOs::Linux => ProfileOs::Linux,
+            },
+            tabs: if tabs.is_empty() {
+                url.map(|value| vec![value.to_string()]).unwrap_or_default()
+            } else {
+                tabs.to_vec()
+            },
+            proxy: match proxy_override {
+                Some(proxy) => ProxyChoice::Custom(proxy.to_string()),
+                None => ProxyChoice::Global,
+            },
+            geo: None,
+        })
+        .await?;
     println!("Created {id} ({})", os.as_str());
-    println!("Browser data: {}", paths.profile(id).display());
+    println!(
+        "Saved location: {} | {} | {} | {}",
+        view.saved_geo.ip,
+        view.saved_geo.country_code,
+        view.saved_geo.region.as_deref().unwrap_or("-"),
+        view.saved_geo.timezone
+    );
+    println!("Browser data: {}", view.browser_data_dir.display());
     Ok(())
 }
 
-async fn open(paths: &Paths, id: &str, url: Option<&str>) -> Result<()> {
+async fn open(
+    paths: &Paths,
+    id: &str,
+    url: Option<&str>,
+    global_proxy: &ProxySettings,
+    progress: &LaunchProgressWriter,
+) -> Result<()> {
     validate_id(id)?;
     let _lock = profile_lock(paths, id)?;
-    let mut persona = paths.store().require(id).await?;
+    let mut persona = paths.store()?.require(id).await?;
+    let proxy = profile_proxy(&paths.root, &persona, global_proxy)?;
     let targets = match url {
         Some(value) => vec![validate_url(value)?],
         None => startup_tabs(&persona)?,
     };
     let targets = if targets.is_empty() {
-        vec![DEFAULT_URL.to_string()]
+        vec!["about:blank".to_string()]
     } else {
         targets
     };
     // A missing proxy must never turn this launch into direct traffic.
-    check_proxy().await?;
-    let proxy_ip = public_ip(Some(DEFAULT_PROXY)).await?;
+    progress.stage(LaunchStage::CheckProxy, None)?;
+    proxy.check().await?;
+    let proxy_guard =
+        if persona.metadata.get("proxy_mode").and_then(Value::as_str) == Some("custom") {
+            prepare_browser_launch_with_progress(
+                &paths.root,
+                id,
+                &proxy,
+                &global_proxy.browser_url(),
+                |stage, detail| progress.stage(stage, detail),
+            )
+            .await?
+        } else {
+            None
+        };
+    progress.stage(LaunchStage::GeoIp, None)?;
+    let (saved_geo, _) = checked_location_with_progress(&persona, id, &proxy, || {
+        progress.stage(LaunchStage::VerifyGeo, None)
+    })
+    .await?;
+    progress.stage(LaunchStage::StartBrowser, None)?;
     prepare_browser_files(paths)?;
-    println!("Opening {id} via {DEFAULT_PROXY}: {}", targets.join(", "));
-    let options = pinned_launch_options(paths, id, &mut persona, &proxy_ip).await?;
+    println!(
+        "Opening {id} via {}: {}",
+        proxy.browser_url(),
+        targets.join(", ")
+    );
+    let options = pinned_launch_options(paths, id, &mut persona, &saved_geo, &proxy).await?;
+    let runtime_listener = BrowserRuntime::new(&paths.root).bind(id).await?;
     let mut browser = launch_with_juggler(&options).await?;
+    drop(proxy_guard);
     let run = tokio::select! {
         result = async {
             for target in &targets {
                 let page = browser.new_page().await?;
                 page.goto(target).await?;
             }
+            progress.emit(LaunchEvent::Ready)?;
             println!("Browser PID: {:?}. Close the browser to exit.", browser.child.id());
             let status = browser.child.wait().await?;
             println!("Browser exited: {status}");
@@ -420,12 +539,34 @@ async fn open(paths: &Paths, id: &str, url: Option<&str>) -> Result<()> {
             signal?;
             println!("Closing browser");
             Ok(())
-        }
+        },
+        result = runtime_listener.wait_for_close() => {
+            result?;
+            println!("Closing browser on local request");
+            Ok(())
+        },
     };
     if run.is_err() || browser.child.try_wait()?.is_none() {
         close_browser(&mut browser).await?;
     }
     run
+}
+
+async fn open_reported(
+    paths: &Paths,
+    id: &str,
+    url: Option<&str>,
+    global_proxy: &ProxySettings,
+    progress_file: Option<PathBuf>,
+) -> Result<()> {
+    let progress = LaunchProgressWriter::new(progress_file);
+    if let Err(error) = open(paths, id, url, global_proxy, &progress).await {
+        let _ = progress.emit(LaunchEvent::Failed {
+            message: format!("{error:#}"),
+        });
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn close_browser(browser: &mut JugglerBrowser) -> Result<()> {
@@ -438,17 +579,28 @@ async fn close_browser(browser: &mut JugglerBrowser) -> Result<()> {
     Ok(())
 }
 
-async fn launch_options(paths: &Paths, id: &str, persona: PersonaRecord) -> Result<LaunchOptions> {
+async fn launch_options(
+    paths: &Paths,
+    id: &str,
+    persona: PersonaRecord,
+    proxy: &ProxySettings,
+) -> Result<LaunchOptions> {
     let mut options = LaunchOptions {
         os: vec![persona_os(&persona)?],
         persona: Some(persona),
         i_know_what_im_doing: true,
         persistent_profile: Some(paths.profile(id)),
         proxy: Some(ProxyConfig {
-            server: DEFAULT_PROXY.into(),
+            server: proxy.browser_url(),
+            username: proxy
+                .credentials()
+                .map(|(username, _)| username.to_string()),
+            password: proxy
+                .credentials()
+                .map(|(_, password)| password.to_string()),
             ..Default::default()
         }),
-        geoip: Some(None),
+        geoip: None,
         block_webrtc: true,
         enable_cache: true,
         headless: HeadlessMode::Off,
@@ -458,28 +610,7 @@ async fn launch_options(paths: &Paths, id: &str, persona: PersonaRecord) -> Resu
     };
     // Apply proxy prefs before Firefox's startup networking; Juggler then
     // configures the same proxy through its native protocol for page traffic.
-    options
-        .firefox_user_prefs
-        .insert("network.proxy.type".into(), json!(1));
-    options
-        .firefox_user_prefs
-        .insert("network.proxy.socks".into(), json!("127.0.0.1"));
-    options
-        .firefox_user_prefs
-        .insert("network.proxy.socks_port".into(), json!(12334));
-    options
-        .firefox_user_prefs
-        .insert("network.proxy.socks_version".into(), json!(5));
-    options
-        .firefox_user_prefs
-        .insert("network.proxy.socks_remote_dns".into(), json!(true));
-    options
-        .firefox_user_prefs
-        .insert("network.proxy.no_proxies_on".into(), json!(""));
-    options.firefox_user_prefs.insert(
-        "network.proxy.allow_hijacking_localhost".into(),
-        json!(true),
-    );
+    proxy.apply_firefox_prefs(&mut options.firefox_user_prefs);
     // Camoufox 152 declares canvas:seed, but Firefox's baseline protection
     // still adds a fresh per-process image-export salt. Disable that layer so
     // the saved canvas/font configuration remains observable across launches.
@@ -494,67 +625,163 @@ async fn pinned_launch_options(
     paths: &Paths,
     id: &str,
     persona: &mut PersonaRecord,
-    proxy_ip: &str,
+    geo: &ProfileGeo,
+    proxy: &ProxySettings,
 ) -> Result<LaunchOptions> {
-    let mut options = launch_options(paths, id, persona.clone()).await?;
+    let mut options = launch_options(paths, id, persona.clone(), proxy).await?;
     if let Some(value) = persona.metadata.get("pinned_launch") {
-        let pinned_ip = metadata_str(persona, "pinned_proxy_ip")?;
-        if pinned_ip != proxy_ip {
-            bail!(
-                "proxy exit changed from {pinned_ip} to {proxy_ip}; run `browserctl-rs refresh {id}` to rotate this identity"
-            );
-        }
         let pinned_version = metadata_str(persona, "pinned_browser_version")?;
         if pinned_version != installed_ver_str()? {
             bail!(
-                "Camoufox version changed; run `browserctl-rs refresh {id}` to rotate this identity"
+                "Camoufox version changed; this pinned identity needs a compatible browser installation"
             );
         }
-        let prepared: PreparedLaunch =
+        let mut prepared: PreparedLaunch =
             serde_json::from_value(value.clone()).context("saved launch identity is invalid")?;
         if prepared.executable_path != *options.executable_path.as_ref().unwrap() {
             bail!(
-                "browser installation moved; run `browserctl-rs refresh {id}` to rebuild this identity"
+                "browser installation moved; restore the original browser installation for this pinned identity"
             );
         }
+        prepared.proxy = Some(proxy.browser_url());
+        proxy.apply_firefox_prefs(&mut prepared.firefox_user_prefs);
         options.prepared_override = Some(prepared);
     } else {
-        options.geoip = Some(Some(proxy_ip.to_string()));
-        let prepared = prepare(&options).await?;
+        options.geoip = None;
+        options.geolocation_override = Some(geo.as_geolocation()?);
+        let mut prepared = prepare(&options).await?;
+        // Authentication belongs to the general proxy setting. A pinned
+        // fingerprint must not retain an old proxy password.
+        prepared.proxy = Some(proxy.browser_url());
         persona
             .metadata
             .insert("pinned_launch".into(), serde_json::to_value(&prepared)?);
         persona
             .metadata
-            .insert("pinned_proxy_ip".into(), json!(proxy_ip));
-        persona
-            .metadata
             .insert("pinned_browser_version".into(), json!(installed_ver_str()?));
-        paths.store().save(persona).await?;
+        paths.store()?.save(persona).await?;
         options.prepared_override = Some(prepared);
-        println!("Pinned launch identity for {id} at proxy exit {proxy_ip}");
+        println!(
+            "Pinned launch identity for {id} in {} / {}",
+            geo.country_code, geo.timezone
+        );
     }
     Ok(options)
 }
 
-async fn refresh(paths: &Paths, id: &str) -> Result<()> {
+async fn checked_location(
+    persona: &PersonaRecord,
+    id: &str,
+    proxy: &ProxySettings,
+) -> Result<(ProfileGeo, ProfileGeo)> {
+    checked_location_with_progress(persona, id, proxy, || Ok(())).await
+}
+
+async fn checked_location_with_progress(
+    persona: &PersonaRecord,
+    id: &str,
+    proxy: &ProxySettings,
+    report_verification: impl FnOnce() -> Result<()>,
+) -> Result<(ProfileGeo, ProfileGeo)> {
+    let saved: ProfileGeo =
+        serde_json::from_value(persona.metadata.get("geo").cloned().with_context(|| {
+            format!("profile {id} has no saved location; run `browserctl-rs refresh {id}`")
+        })?)?;
+    let current = ProfileGeo::lookup(proxy).await?;
+    report_verification()?;
+    let changes = saved.changes_from(&current);
+    if !changes.is_empty() {
+        bail!(
+            "profile {id} location mismatch; browser was not started. Saved: {} / {} / {}. Current proxy exit {}: {} / {} / {}. Changed: {}. Run `browserctl-rs refresh {id}` if intentional",
+            saved.country_code,
+            saved
+                .region_code
+                .as_deref()
+                .or(saved.region.as_deref())
+                .unwrap_or("-"),
+            saved.timezone,
+            current.ip,
+            current.country_code,
+            current
+                .region_code
+                .as_deref()
+                .or(current.region.as_deref())
+                .unwrap_or("-"),
+            current.timezone,
+            changes.join("; ")
+        );
+    }
+    println!(
+        "Current GeoIP matches {id}: {} | {} | {} | {} | {}",
+        current.ip,
+        current.country_code,
+        current.region.as_deref().unwrap_or("-"),
+        current.timezone,
+        current.locale
+    );
+    Ok((saved, current))
+}
+
+fn update_launch_geo(prepared: &mut PreparedLaunch, geo: &ProfileGeo) -> Result<()> {
+    for key in [
+        "geolocation:latitude",
+        "geolocation:longitude",
+        "geolocation:accuracy",
+        "timezone",
+        "locale:region",
+        "locale:language",
+        "locale:script",
+        "locale:all",
+    ] {
+        prepared.config.remove(key);
+    }
+    for (key, value) in geo.as_geolocation()?.as_config()? {
+        prepared.config.insert(key, value);
+    }
+    let user_agent = prepared
+        .config
+        .get("navigator.userAgent")
+        .and_then(Value::as_str)
+        .context("saved launch has no user agent")?;
+    let target_os = determine_ua_os(user_agent)?;
+    prepared
+        .env
+        .retain(|key, _| !key.starts_with("CAMOU_CONFIG_"));
+    prepared.env.extend(get_env_vars(
+        &prepared.config,
+        target_os,
+        Some(&install_dir()),
+    )?);
+    Ok(())
+}
+
+async fn refresh(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Result<()> {
     validate_id(id)?;
     let _lock = profile_lock(paths, id)?;
-    check_proxy().await?;
-    prepare_browser_files(paths)?;
-    let proxy_ip = public_ip(Some(DEFAULT_PROXY)).await?;
-    let mut persona = paths.store().require(id).await?;
-    for key in [
-        "pinned_launch",
-        "pinned_proxy_ip",
-        "pinned_browser_version",
-        "browserscan_baseline",
-    ] {
-        persona.metadata.remove(key);
+    let mut persona = paths.store()?.require(id).await?;
+    let proxy = profile_proxy(&paths.root, &persona, global_proxy)?;
+    proxy.check().await?;
+    let geo = ProfileGeo::lookup(&proxy).await?;
+    if let Some(value) = persona.metadata.get("pinned_launch") {
+        let mut prepared: PreparedLaunch = serde_json::from_value(value.clone())?;
+        update_launch_geo(&mut prepared, &geo)?;
+        prepared.proxy = Some(proxy.browser_url());
+        persona
+            .metadata
+            .insert("pinned_launch".into(), serde_json::to_value(prepared)?);
     }
-    pinned_launch_options(paths, id, &mut persona, &proxy_ip).await?;
+    persona
+        .metadata
+        .insert("geo".into(), serde_json::to_value(&geo)?);
+    persona.metadata.remove("pinned_proxy_ip");
+    persona.metadata.remove("browserscan_baseline");
+    paths.store()?.save(&persona).await?;
     println!(
-        "Refreshed {id}; run `browserctl-rs scan {id}` to establish a new BrowserScan baseline"
+        "Refreshed {id}: {} | {} | {} | {}",
+        geo.ip,
+        geo.country_code,
+        geo.region.as_deref().unwrap_or("-"),
+        geo.timezone
     );
     Ok(())
 }
@@ -562,7 +789,7 @@ async fn refresh(paths: &Paths, id: &str) -> Result<()> {
 async fn set_tabs(paths: &Paths, id: &str, urls: &[String], clear: bool) -> Result<()> {
     validate_id(id)?;
     let _lock = profile_lock(paths, id)?;
-    let store = paths.store();
+    let store = paths.store()?;
     let mut persona = store.require(id).await?;
     if clear || !urls.is_empty() {
         let tabs = if clear {
@@ -584,11 +811,8 @@ async fn set_tabs(paths: &Paths, id: &str, urls: &[String], clear: bool) -> Resu
     Ok(())
 }
 
-async fn delete(paths: &Paths, id: &str, yes: bool) -> Result<()> {
+async fn delete(paths: &Paths, id: &str, yes: bool, global_proxy: &ProxySettings) -> Result<()> {
     validate_id(id)?;
-    let _lock = profile_lock(paths, id)?;
-    let store = paths.store();
-    store.require(id).await?;
     if !yes {
         print!("Type {id} to permanently delete this profile and its browser data: ");
         io::stdout().flush()?;
@@ -598,65 +822,49 @@ async fn delete(paths: &Paths, id: &str, yes: bool) -> Result<()> {
             bail!("deletion cancelled");
         }
     }
-    let profile = paths.profile(id);
-    let quarantined = if profile.exists() {
-        let trash = paths.root.join("trash");
-        fs::create_dir_all(&trash)?;
-        let destination = trash.join(format!("{id}-{}", rand::thread_rng().r#gen::<u64>()));
-        fs::rename(&profile, &destination)?;
-        Some(destination)
-    } else {
-        None
-    };
-    if let Err(error) = store.delete(id).await {
-        if let Some(destination) = quarantined.as_ref() {
-            fs::rename(destination, &profile).with_context(|| {
-                format!(
-                    "could not restore {} after store error: {error}",
-                    profile.display()
-                )
-            })?;
-        }
-        return Err(error.into());
-    }
-    if let Some(destination) = quarantined {
-        fs::remove_dir_all(&destination).with_context(|| {
-            format!(
-                "profile deleted, but could not remove quarantined browser data at {}",
-                destination.display()
-            )
-        })?;
-    }
-    for suffix in ["browserscan.png", "browserscan.txt", "fingerprint.json"] {
-        let artifact = paths.root.join("artifacts").join(format!("{id}-{suffix}"));
-        match fs::remove_file(artifact) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
+    ProfileService::with_proxy(&paths.root, global_proxy.clone())?
+        .delete(id)
+        .await?;
     println!("Deleted {id}");
     Ok(())
 }
 
-async fn scan(paths: &Paths, id: &str) -> Result<()> {
+async fn scan(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Result<()> {
     validate_id(id)?;
     let _lock = profile_lock(paths, id)?;
-    let mut persona = paths.store().require(id).await?;
-    check_proxy().await?;
-    let expected_ip = public_ip(Some(DEFAULT_PROXY)).await?;
+    let mut persona = paths.store()?.require(id).await?;
+    let proxy = profile_proxy(&paths.root, &persona, global_proxy)?;
+    proxy.check().await?;
+    let proxy_guard =
+        if persona.metadata.get("proxy_mode").and_then(Value::as_str) == Some("custom") {
+            prepare_browser_launch_with_progress(
+                &paths.root,
+                id,
+                &proxy,
+                &global_proxy.browser_url(),
+                |_, _| Ok(()),
+            )
+            .await?
+        } else {
+            None
+        };
+    let (saved_geo, current_geo) = checked_location(&persona, id, &proxy).await?;
+    let expected_ip = current_geo.ip;
     prepare_browser_files(paths)?;
-    let options = pinned_launch_options(paths, id, &mut persona, &expected_ip).await?;
+    let options = pinned_launch_options(paths, id, &mut persona, &saved_geo, &proxy).await?;
+    let runtime_listener = BrowserRuntime::new(&paths.root).bind(id).await?;
     let mut browser = launch_with_juggler(&options).await?;
+    drop(proxy_guard);
     let result: Result<()> = tokio::select! {
         result = async {
         let page = browser.new_page().await?;
-        page.goto(DEFAULT_URL).await?;
+        page.goto(BROWSERSCAN_URL).await?;
         let artifacts = paths.root.join("artifacts");
         fs::create_dir_all(&artifacts)?;
         let screenshot = artifacts.join(format!("{id}-browserscan.png"));
         let report_file = artifacts.join(format!("{id}-browserscan.txt"));
         let verification_file = artifacts.join(format!("{id}-fingerprint.json"));
+        let fields_file = artifacts.join(format!("{id}-browserscan-fields.json"));
         let ip_pattern = Regex::new(r"(?m)^IP\s*\n([0-9a-fA-F:.]+)\s*(?:\(|\n)")?;
         let mut report = String::new();
         let mut observed_ip = None;
@@ -730,29 +938,20 @@ async fn scan(paths: &Paths, id: &str) -> Result<()> {
         }
         let scan_identity =
             scan_identity.context("BrowserScan did not finish fingerprint reporting")?;
-        if let Some(saved) = persona.metadata.get("browserscan_baseline") {
-            let baseline: ScanIdentity = serde_json::from_value(saved.clone())?;
-            scan_identity.compare(&baseline)?;
-            println!(
-                "BrowserScan identity matches the saved baseline ({} fields)",
-                SCAN_IDENTITY_FIELDS.len()
-            );
-        } else {
-            persona.metadata.insert(
-                "browserscan_baseline".into(),
-                serde_json::to_value(&scan_identity)?,
-            );
-            paths.store().save(&persona).await?;
-            println!(
-                "Saved BrowserScan identity baseline ({} fields)",
-                SCAN_IDENTITY_FIELDS.len()
-            );
+        if !scan_identity.0.get("Languages").is_some_and(|languages| languages.starts_with(&saved_geo.locale)) {
+            bail!("BrowserScan language did not match saved locale {}", saved_geo.locale);
         }
+        fs::write(&fields_file, serde_json::to_vec_pretty(&scan_identity)?)?;
+        println!("BrowserScan fields: {} (diagnostic only)", fields_file.display());
         Ok(())
         } => result,
         signal = tokio::signal::ctrl_c() => {
             signal?;
             bail!("scan interrupted");
+        },
+        result = runtime_listener.wait_for_close() => {
+            result?;
+            bail!("scan closed by browser manager");
         }
     };
     close_browser(&mut browser).await?;
@@ -761,6 +960,14 @@ async fn scan(paths: &Paths, id: &str) -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     let paths = Paths::new(cli.data_dir)?;
+    let global_proxy = if matches!(&cli.command, Command::Ui) {
+        GeneralSettings::load(&paths.root)?.proxy()?
+    } else {
+        match cli.global_proxy {
+            Some(value) => ProxySettings::parse(&value)?,
+            None => GeneralSettings::load(&paths.root)?.proxy()?,
+        }
+    };
     // Separate this installation from the Python Camoufox environment.
     set_install_dir(Some(paths.browser()));
     match cli.command {
@@ -769,9 +976,26 @@ async fn run(cli: Cli) -> Result<()> {
             prepare_browser_files(&paths)?;
             println!("Installed Camoufox in {}", install_dir().display());
         }
-        Command::Create { id, os, url, tabs } => create(&paths, &id, os, &url, &tabs).await?,
+        Command::Create {
+            id,
+            proxy,
+            os,
+            url,
+            tabs,
+        } => {
+            create(
+                &paths,
+                &id,
+                os,
+                url.as_deref(),
+                &tabs,
+                proxy.as_deref(),
+                &global_proxy,
+            )
+            .await?
+        }
         Command::List { json } => {
-            let summaries = paths.store().list().await?;
+            let summaries = paths.store()?.list().await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&summaries)?);
             } else if summaries.is_empty() {
@@ -784,16 +1008,17 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Show { id } => {
             validate_id(&id)?;
-            let persona = paths.store().require(&id).await?;
+            let persona = paths.store()?.require(&id).await?;
+            let proxy = profile_proxy(&paths.root, &persona, &global_proxy)?;
             let summary = json!({
                 "id": persona.id,
                 "name": persona.name,
                 "created_at": persona.created_at,
                 "os": metadata_str(&persona, "os")?,
                 "startup_tabs": startup_tabs(&persona)?,
-                "proxy": DEFAULT_PROXY,
-                "pinned_proxy_ip": persona.metadata.get("pinned_proxy_ip"),
-                "browserscan_baseline": persona.metadata.contains_key("browserscan_baseline"),
+                "proxy_mode": persona.metadata.get("proxy_mode").and_then(Value::as_str).unwrap_or("global"),
+                "proxy": proxy.browser_url(),
+                "saved_geo": persona.metadata.get("geo"),
                 "profile_dir": paths.profile(&id),
                 "user_agent": persona.fingerprint.fingerprint.navigator.user_agent,
             });
@@ -806,23 +1031,27 @@ async fn run(cli: Cli) -> Result<()> {
             let details = json!({
                 "data_dir": paths.root,
                 "browser_install": paths.browser(),
-                "persona_store": paths.personas(),
+                "persona_store": paths.database(),
                 "browser_data": id.map(|id| paths.profile(&id)),
             });
             println!("{}", serde_json::to_string_pretty(&details)?);
         }
         Command::Tabs { id, urls, clear } => set_tabs(&paths, &id, &urls, clear).await?,
-        Command::Open { id, url } => open(&paths, &id, url.as_deref()).await?,
-        Command::Scan { id } => scan(&paths, &id).await?,
-        Command::Refresh { id } => refresh(&paths, &id).await?,
-        Command::Delete { id, yes } => delete(&paths, &id, yes).await?,
+        Command::Open {
+            id,
+            url,
+            progress_file,
+        } => open_reported(&paths, &id, url.as_deref(), &global_proxy, progress_file).await?,
+        Command::Scan { id } => scan(&paths, &id, &global_proxy).await?,
+        Command::Refresh { id } => refresh(&paths, &id, &global_proxy).await?,
+        Command::Delete { id, yes } => delete(&paths, &id, yes, &global_proxy).await?,
         Command::Doctor => {
             println!("Data directory: {}", paths.root.display());
             println!("Browser directory: {}", install_dir().display());
-            let proxy_status = check_proxy().await;
+            let proxy_status = global_proxy.check().await;
             match &proxy_status {
-                Ok(()) => println!("Proxy {DEFAULT_PROXY}: reachable"),
-                Err(error) => println!("Proxy {DEFAULT_PROXY}: {error:#}"),
+                Ok(()) => println!("Proxy {}: reachable", global_proxy.browser_url()),
+                Err(error) => println!("Proxy {}: {error:#}", global_proxy.browser_url()),
             }
             if paths.browser().join("version.json").exists() {
                 println!("Browser installed: {}", installed_ver_str()?);
@@ -830,6 +1059,65 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("Browser: not installed; run `browserctl-rs fetch`");
             }
             proxy_status?;
+        }
+        Command::Ui => ui::run(paths, global_proxy)?,
+        Command::Proxy { action } => {
+            let catalog = ProxyCatalog::new(&paths.root);
+            match action {
+                ProxyAction::List => {
+                    let records: Vec<_> = catalog
+                        .list()?
+                        .into_iter()
+                        .map(|proxy| {
+                            json!({
+                                "id": proxy.id,
+                                "name": proxy.name,
+                                "url": proxy.url,
+                                "has_auth": proxy.credentials.is_some(),
+                                "policy": proxy.policy,
+                                "ip_switch": proxy.ip_switch,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&records)?)
+                }
+                ProxyAction::Set {
+                    id,
+                    url,
+                    name,
+                    policy,
+                    switch_url,
+                    switch_method,
+                    rotate_on_start,
+                    wait_seconds,
+                } => {
+                    let normalized_url = ProxySettings::parse(&url)?.browser_url();
+                    let credentials = catalog
+                        .list()?
+                        .into_iter()
+                        .find(|proxy| proxy.id == id && proxy.url == normalized_url)
+                        .and_then(|proxy| proxy.credentials);
+                    let ip_switch = switch_url.map(|url| IpSwitch {
+                        url,
+                        method: switch_method.into(),
+                        on_start: rotate_on_start,
+                        wait_seconds,
+                    });
+                    let saved = catalog.upsert(ManagedProxy {
+                        name: name.unwrap_or_else(|| id.clone()),
+                        id,
+                        url,
+                        credentials,
+                        policy: policy.into(),
+                        ip_switch,
+                    })?;
+                    println!("Managed proxy {}: {}", saved.id, saved.url);
+                }
+                ProxyAction::Remove { id } => {
+                    catalog.remove(&id)?;
+                    println!("Removed managed proxy {id}");
+                }
+            }
         }
     }
     Ok(())
@@ -844,6 +1132,22 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_browser::launch_progress::read_events;
+
+    #[tokio::test]
+    async fn open_failure_is_reported_to_native_ui() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let progress_file = dir.path().join("launch.jsonl");
+        let proxy = ProxySettings::parse(rust_browser::proxy::DEFAULT_PROXY).unwrap();
+        assert!(
+            open_reported(&paths, "missing", None, &proxy, Some(progress_file.clone()))
+                .await
+                .is_err()
+        );
+        let events = read_events(&progress_file).unwrap();
+        assert!(matches!(events.last(), Some(LaunchEvent::Failed { .. })));
+    }
 
     #[test]
     fn rejects_unsafe_profile_ids_and_urls() {
@@ -860,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn browserscan_identity_requires_complete_values_and_detects_drift() {
+    fn browserscan_identity_requires_complete_values() {
         let mut report = String::new();
         for label in SCAN_IDENTITY_FIELDS {
             let value = if [
@@ -880,64 +1184,10 @@ mod tests {
             };
             report.push_str(&format!("{label}\n{value}\n"));
         }
-        let baseline = ScanIdentity::parse(&report).unwrap();
-        let changed =
-            ScanIdentity::parse(&report.replace("Canvas\n1234ABCD", "Canvas\nDEADBEEF")).unwrap();
-        assert!(changed.compare(&baseline).is_err());
-        assert!(ScanIdentity::parse(&report.replace("Canvas\n1234ABCD", "Canvas\nWebGL")).is_err());
-    }
-
-    #[tokio::test]
-    async fn saved_persona_is_stable_and_duplicate_creation_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-        create(
-            &paths,
-            "account-a",
-            BrowserOs::Windows,
-            "https://example.com",
-            &[],
-        )
-        .await
-        .unwrap();
-        let first = paths.store().require("account-a").await.unwrap();
-        assert_eq!(metadata_str(&first, "os").unwrap(), "windows");
-        assert_eq!(startup_tabs(&first).unwrap(), ["https://example.com/"]);
-        assert!(
-            create(
-                &paths,
-                "account-a",
-                BrowserOs::Linux,
-                "https://example.org",
-                &[]
-            )
-            .await
-            .is_err()
-        );
-        let second = paths.store().require("account-a").await.unwrap();
-        assert_eq!(first.seed, second.seed);
         assert_eq!(
-            first.fingerprint.fingerprint.navigator.user_agent,
-            second.fingerprint.fingerprint.navigator.user_agent
+            ScanIdentity::parse(&report).unwrap().0.len(),
+            SCAN_IDENTITY_FIELDS.len()
         );
-        set_tabs(
-            &paths,
-            "account-a",
-            &["https://www.vinted.fr".into()],
-            false,
-        )
-        .await
-        .unwrap();
-        let third = paths.store().require("account-a").await.unwrap();
-        assert_eq!(startup_tabs(&third).unwrap(), ["https://www.vinted.fr/"]);
-        fs::create_dir_all(paths.profile("account-a")).unwrap();
-        fs::write(paths.profile("account-a").join("cookies.sqlite"), b"saved").unwrap();
-        fs::create_dir_all(paths.root.join("artifacts")).unwrap();
-        let artifact = paths.root.join("artifacts/account-a-browserscan.txt");
-        fs::write(&artifact, b"scan").unwrap();
-        delete(&paths, "account-a", true).await.unwrap();
-        assert!(paths.store().load("account-a").await.unwrap().is_none());
-        assert!(!paths.profile("account-a").exists());
-        assert!(!artifact.exists());
+        assert!(ScanIdentity::parse(&report.replace("Canvas\n1234ABCD", "Canvas\nWebGL")).is_err());
     }
 }

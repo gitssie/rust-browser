@@ -7,8 +7,11 @@ copies. The crates declare the MPL-2.0 license.
 
 Local changes:
 
+- `camoufox-core/src/locale.rs`: expose deterministic dominant-territory
+  locale selection for Profile location pinning.
 - `camoufox/src/builder.rs`: allow a Profile to reuse a saved
-  `PreparedLaunch`, keeping all generated fingerprint configuration stable.
+  `PreparedLaunch` and accept a saved location from ipwho.is, keeping the
+  fingerprint configuration stable without substituting a second GeoIP source.
 - `camoufox-juggler/src/driver.rs` and `src/transport.rs`: kill and reap Firefox
   if Juggler startup fails after the process is spawned, and kill it on drop on
   Unix.

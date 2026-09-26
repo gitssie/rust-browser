@@ -530,6 +530,8 @@ mod sqlite_impl {
             let display = path.as_ref().display().to_string();
             let conn =
                 Connection::open(path).map_err(|e| storage_io(&format!("open {display}"), e))?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|e| storage_io("set busy timeout", e))?;
             conn.pragma_update(None, "journal_mode", "WAL")
                 .map_err(|e| storage_io("set WAL", e))?;
             conn.execute_batch(SCHEMA)
