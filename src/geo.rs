@@ -106,7 +106,7 @@ impl ProfileGeo {
         })
     }
 
-    /// Python's location_changes: IP, city and coordinates may rotate.
+    /// Keep country and timezone stable; IP and subdivisions may rotate.
     pub fn changes_from(&self, current: &Self) -> Vec<String> {
         let mut changes = Vec::new();
         for (field, saved, observed) in [
@@ -124,17 +124,6 @@ impl ProfileGeo {
             if normalized(saved) != normalized(observed) {
                 changes.push(format!("{field}: {saved:?} -> {observed:?}"));
             }
-        }
-        let (field, saved, observed) =
-            if let Some(code) = self.region_code.as_deref().filter(|s| !s.is_empty()) {
-                ("region_code", Some(code), current.region_code.as_deref())
-            } else {
-                ("region", self.region.as_deref(), current.region.as_deref())
-            };
-        if let Some(saved) = saved.filter(|s| !s.is_empty())
-            && observed.is_none_or(|value| normalized(saved) != normalized(value))
-        {
-            changes.push(format!("{field}: {saved:?} -> {observed:?}"));
         }
         changes
     }
@@ -169,21 +158,30 @@ mod tests {
     }
 
     #[test]
-    fn same_region_allows_ip_city_and_coordinates_to_rotate() {
+    fn same_country_and_timezone_allow_ip_region_city_and_coordinates_to_rotate() {
         let saved = sample();
         let current = ProfileGeo {
             ip: "203.0.113.11".into(),
-            region: Some("Île de France".into()),
+            region: Some("Auvergne-Rhône-Alpes".into()),
             city: Some("Saint-Denis".into()),
             latitude: 48.9,
             ..saved.clone()
         };
         assert!(saved.changes_from(&current).is_empty());
         assert_eq!(saved.as_geolocation().unwrap().latitude, 48.8534);
+        let saved = ProfileGeo {
+            region_code: Some("ARA".into()),
+            ..saved
+        };
+        let current = ProfileGeo {
+            region_code: Some("HDF".into()),
+            ..current
+        };
+        assert!(saved.changes_from(&current).is_empty());
     }
 
     #[test]
-    fn rejects_region_country_and_timezone_drift() {
+    fn rejects_country_and_timezone_drift() {
         let saved = sample();
         let current = ProfileGeo {
             country_code: "DE".into(),
@@ -191,20 +189,6 @@ mod tests {
             timezone: "Europe/Berlin".into(),
             ..saved.clone()
         };
-        assert_eq!(saved.changes_from(&current).len(), 3);
-        let saved = ProfileGeo {
-            region_code: Some("IDF".into()),
-            ..saved
-        };
-        let current = ProfileGeo {
-            region_code: Some("ARA".into()),
-            ..current
-        };
-        assert!(
-            saved
-                .changes_from(&current)
-                .iter()
-                .any(|change| change.contains("region_code"))
-        );
+        assert_eq!(saved.changes_from(&current).len(), 2);
     }
 }

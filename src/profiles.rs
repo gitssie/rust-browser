@@ -185,7 +185,7 @@ impl ProfileGeoInput {
         let changes = geo.changes_from(&observed);
         if !changes.is_empty() {
             return Err(ProfileError::Invalid(format!(
-                "custom location must match the proxy exit country, region and timezone: {}",
+                "custom location must match the proxy exit country and timezone: {}",
                 changes.join("; ")
             )));
         }
@@ -992,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_geo_keeps_proxy_ip_and_rejects_region_drift() {
+    fn custom_geo_keeps_proxy_ip_and_allows_region_drift() {
         let observed = geo();
         let custom = ProfileGeoInput {
             country_code: "FR".into(),
@@ -1008,14 +1008,14 @@ mod tests {
         assert_eq!(saved.ip, observed.ip);
         assert_eq!(saved.city.as_deref(), Some("Saint-Denis"));
         assert_eq!(saved.source, "custom+ipwho.is");
-        assert!(matches!(
+        assert!(
             ProfileGeoInput {
-                region: Some("Bavaria".into()),
+                region: Some("Hauts-de-France".into()),
                 ..custom.clone()
             }
-            .apply_to(observed.clone()),
-            Err(ProfileError::Invalid(_))
-        ));
+            .apply_to(observed.clone())
+            .is_ok()
+        );
         assert!(matches!(
             ProfileGeoInput {
                 region: None,
