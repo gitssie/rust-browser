@@ -20,6 +20,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement,
+    select::{Select, SelectEvent, SelectItem, SelectState},
     v_flex,
 };
 use rust_browser::browser_manager::{
@@ -130,6 +131,70 @@ enum Dialog {
     Edit(String),
     Delete(String),
     CloseAll,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProfileProxySelection {
+    Global,
+    Managed(String),
+    ExistingCustom(String),
+}
+
+#[derive(Clone)]
+struct ProfileProxyOption {
+    label: SharedString,
+    value: ProfileProxySelection,
+}
+
+impl SelectItem for ProfileProxyOption {
+    type Value = ProfileProxySelection;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.value
+    }
+}
+
+fn profile_proxy_options(
+    global: &ProxySettings,
+    managed: &[ManagedProxy],
+    current: Option<&ProxyChoice>,
+) -> Vec<ProfileProxyOption> {
+    let mut options = vec![ProfileProxyOption {
+        label: format!("全局代理 · {}", global.browser_url()).into(),
+        value: ProfileProxySelection::Global,
+    }];
+    options.extend(managed.iter().map(|proxy| ProfileProxyOption {
+        label: format!("{} · {}", proxy.name, proxy.url).into(),
+        value: ProfileProxySelection::Managed(proxy.id.clone()),
+    }));
+    if let Some(ProxyChoice::Custom(url)) = current
+        && !managed.iter().any(|proxy| &proxy.url == url)
+    {
+        options.push(ProfileProxyOption {
+            label: format!("当前独立代理 · {url}").into(),
+            value: ProfileProxySelection::ExistingCustom(url.clone()),
+        });
+    }
+    options
+}
+
+fn profile_proxy_choice(
+    selection: &ProfileProxySelection,
+    managed: &[ManagedProxy],
+) -> Result<ProxyChoice> {
+    match selection {
+        ProfileProxySelection::Global => Ok(ProxyChoice::Global),
+        ProfileProxySelection::Managed(id) => managed
+            .iter()
+            .find(|proxy| &proxy.id == id)
+            .map(|proxy| ProxyChoice::Custom(proxy.url.clone()))
+            .ok_or_else(|| anyhow!("所选代理已不存在，请重新选择")),
+        ProfileProxySelection::ExistingCustom(url) => Ok(ProxyChoice::Custom(url.clone())),
+    }
 }
 
 #[derive(Clone)]
@@ -275,7 +340,7 @@ struct BrowserHome {
     search: Entity<InputState>,
     form_name: Entity<InputState>,
     form_url: Entity<InputState>,
-    form_proxy: Entity<InputState>,
+    form_proxy_select: Entity<SelectState<Vec<ProfileProxyOption>>>,
     form_country_code: Entity<InputState>,
     form_country: Entity<InputState>,
     form_region: Entity<InputState>,
@@ -302,7 +367,6 @@ struct BrowserHome {
     popup: Option<TagPopup>,
     popup_position: Point<Pixels>,
     dialog: Dialog,
-    form_custom_proxy: bool,
     form_os: ProfileOs,
     create_mode: CreateMode,
     geo_preview: Option<ProfileGeo>,
@@ -1020,8 +1084,18 @@ impl BrowserHome {
         let form_name = cx.new(|cx| InputState::new(window, cx).placeholder("显示名称"));
         let form_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://www.vinted.fr/"));
-        let proxy_placeholder = format!("例如 {}", global_proxy.browser_url());
-        let form_proxy = cx.new(|cx| InputState::new(window, cx).placeholder(proxy_placeholder));
+        let managed = ProxyCatalog::new(service.data_dir())
+            .list()
+            .unwrap_or_default();
+        let form_proxy_select = cx.new(|cx| {
+            SelectState::new(
+                profile_proxy_options(&global_proxy, &managed, None),
+                Some(Default::default()),
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
         let form_country_code = cx.new(|cx| InputState::new(window, cx).placeholder("FR"));
         let form_country = cx.new(|cx| InputState::new(window, cx).placeholder("France"));
         let form_region = cx.new(|cx| InputState::new(window, cx).placeholder("Île-de-France"));
@@ -1088,19 +1162,16 @@ impl BrowserHome {
                     .detach();
                 }
             });
-        let proxy_subscription =
-            cx.subscribe_in(&form_proxy, window, |this, _, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change)
-                    && matches!(this.dialog, Dialog::Create)
-                    && this.form_custom_proxy
+        let proxy_subscription = cx.subscribe_in(
+            &form_proxy_select,
+            window,
+            |this, _, event: &SelectEvent<Vec<ProfileProxyOption>>, _, cx| {
+                if matches!(event, SelectEvent::Confirm(_)) && matches!(this.dialog, Dialog::Create)
                 {
-                    this.geo_generation += 1;
-                    this.geo_preview = None;
-                    this.geo_loading = false;
-                    this.geo_error = "代理已改变，请重新检测 GEO IP".into();
-                    cx.notify();
+                    this.detect_geo(cx);
                 }
-            });
+            },
+        );
         let mut general_subscriptions = Vec::new();
         for input in [
             &general_host,
@@ -1119,9 +1190,6 @@ impl BrowserHome {
                 },
             ));
         }
-        let managed = ProxyCatalog::new(service.data_dir())
-            .list()
-            .unwrap_or_default();
         let paths = service.paths().clone();
         let browser_manager = BrowserManager::with_paths(paths.clone());
         let (browser_versions, browser_status) = match browser_manager.installed_versions() {
@@ -1180,7 +1248,7 @@ impl BrowserHome {
             search,
             form_name,
             form_url,
-            form_proxy,
+            form_proxy_select,
             form_country_code,
             form_country,
             form_region,
@@ -1211,7 +1279,6 @@ impl BrowserHome {
             popup: None,
             popup_position: point(px(0.), px(0.)),
             dialog: Dialog::None,
-            form_custom_proxy: false,
             form_os: ProfileOs::Windows,
             create_mode: CreateMode::Smart,
             geo_preview: None,
@@ -1572,7 +1639,14 @@ impl BrowserHome {
 
     fn show_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dialog = Dialog::Create;
-        self.form_custom_proxy = false;
+        if let Ok(managed) = ProxyCatalog::new(self.service.data_dir()).list() {
+            self.managed = managed;
+        }
+        let options = profile_proxy_options(&self.global_proxy, &self.managed, None);
+        self.form_proxy_select.update(cx, |select, cx| {
+            select.set_items(options, window, cx);
+            select.set_selected_value(&ProfileProxySelection::Global, window, cx);
+        });
         self.form_os = ProfileOs::Windows;
         self.create_mode = CreateMode::Smart;
         self.geo_preview = None;
@@ -1581,7 +1655,6 @@ impl BrowserHome {
         for input in [
             &self.form_name,
             &self.form_url,
-            &self.form_proxy,
             &self.form_country_code,
             &self.form_country,
             &self.form_region,
@@ -1599,6 +1672,9 @@ impl BrowserHome {
 
     fn show_edit(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.geo_generation += 1;
+        if let Ok(managed) = ProxyCatalog::new(self.service.data_dir()).list() {
+            self.managed = managed;
+        }
         let Some(profile) = self.rows.iter().find(|row| row.id == id) else {
             return;
         };
@@ -1612,27 +1688,46 @@ impl BrowserHome {
                 cx,
             )
         });
-        self.form_custom_proxy = matches!(profile.proxy, ProxyChoice::Custom(_));
-        self.form_proxy.update(cx, |input, cx| {
-            input.set_value(&profile.effective_proxy, window, cx)
+        let proxy_choice = profile.proxy.clone();
+        let selected = match &proxy_choice {
+            ProxyChoice::Global => ProfileProxySelection::Global,
+            ProxyChoice::Custom(url) => self
+                .managed
+                .iter()
+                .find(|proxy| &proxy.url == url)
+                .map(|proxy| ProfileProxySelection::Managed(proxy.id.clone()))
+                .unwrap_or_else(|| ProfileProxySelection::ExistingCustom(url.clone())),
+        };
+        let options = profile_proxy_options(&self.global_proxy, &self.managed, Some(&proxy_choice));
+        self.form_proxy_select.update(cx, |select, cx| {
+            select.set_items(options, window, cx);
+            select.set_selected_value(&selected, window, cx);
         });
         self.dialog = Dialog::Edit(id);
         cx.notify();
     }
 
+    fn selected_form_proxy(&self, cx: &Context<Self>) -> Result<ProxyChoice> {
+        match self.form_proxy_select.read(cx).selected_value() {
+            Some(selection) => profile_proxy_choice(selection, &self.managed),
+            None => Err(anyhow!("请选择代理")),
+        }
+    }
+
     fn detect_geo(&mut self, cx: &mut Context<Self>) {
-        let proxy = if self.form_custom_proxy {
-            ProxyCatalog::new(self.service.data_dir())
-                .resolve_url(self.form_proxy.read(cx).value().trim())
-        } else {
-            Ok(self.global_proxy.clone())
+        let proxy = match self.selected_form_proxy(cx) {
+            Ok(ProxyChoice::Global) => Ok(self.global_proxy.clone()),
+            Ok(ProxyChoice::Custom(url)) => {
+                ProxyCatalog::new(self.service.data_dir()).resolve_url(&url)
+            }
+            Err(error) => Err(error),
         };
         let proxy = match proxy {
             Ok(proxy) => proxy,
             Err(error) => {
                 self.geo_loading = false;
                 self.geo_preview = None;
-                self.geo_error = format!("请填写有效的 SOCKS5 代理：{error}");
+                self.geo_error = format!("所选代理不可用：{error}");
                 cx.notify();
                 return;
             }
@@ -1669,21 +1764,6 @@ impl BrowserHome {
             });
         })
         .detach();
-        cx.notify();
-    }
-
-    fn select_form_managed_proxy(
-        &mut self,
-        url: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.form_custom_proxy = true;
-        self.form_proxy
-            .update(cx, |input, cx| input.set_value(url, window, cx));
-        if matches!(self.dialog, Dialog::Create) {
-            self.detect_geo(cx);
-        }
         cx.notify();
     }
 
@@ -1726,11 +1806,13 @@ impl BrowserHome {
         }
         let name = self.form_name.read(cx).value().trim().to_string();
         let url = self.form_url.read(cx).value().trim().to_string();
-        let proxy = self.form_proxy.read(cx).value().trim().to_string();
-        let choice = if self.form_custom_proxy {
-            ProxyChoice::Custom(proxy)
-        } else {
-            ProxyChoice::Global
+        let choice = match self.selected_form_proxy(cx) {
+            Ok(choice) => choice,
+            Err(error) => {
+                self.geo_error = error.to_string();
+                cx.notify();
+                return;
+            }
         };
         let tabs = if url.is_empty() {
             Vec::new()
@@ -3762,11 +3844,6 @@ impl BrowserHome {
 
     fn render_create_body(&self, cx: &mut Context<Self>) -> AnyElement {
         let smart = self.create_mode == CreateMode::Smart;
-        let proxy_description = if self.form_custom_proxy {
-            "使用此 Profile 的独立代理".to_string()
-        } else {
-            self.global_proxy.browser_url()
-        };
         let geo_content: AnyElement = if smart {
             v_flex()
                 .gap_3()
@@ -3959,39 +4036,11 @@ impl BrowserHome {
                             .child("代理"),
                     )
                     .child(
-                        Button::new("create-proxy-mode")
-                            .outline()
-                            .small()
-                            .label(if self.form_custom_proxy {
-                                "独立配置"
-                            } else {
-                                "跟随全局"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.form_custom_proxy = !this.form_custom_proxy;
-                                this.geo_generation += 1;
-                                this.geo_preview = None;
-                                this.geo_loading = false;
-                                this.geo_error.clear();
-                                if !this.form_custom_proxy {
-                                    this.detect_geo(cx);
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(proxy_description),
+                            .flex_1()
+                            .child(Select::new(&self.form_proxy_select).w_full()),
                     ),
             )
-            .child(if self.form_custom_proxy {
-                form_field("SOCKS5", &self.form_proxy, cx)
-            } else {
-                div().into_any_element()
-            })
-            .child(self.render_form_managed_proxies(cx))
             .child(
                 h_flex()
                     .items_center()
@@ -4042,39 +4091,6 @@ impl BrowserHome {
             .into_any_element()
     }
 
-    fn render_form_managed_proxies(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.managed.is_empty() {
-            return div().into_any_element();
-        }
-        let selected_url = self.form_proxy.read(cx).value().trim().to_string();
-        let mut choices = v_flex().gap_1().max_h(px(136.)).overflow_y_scrollbar();
-        for record in &self.managed {
-            let url = record.url.clone();
-            let selected = self.form_custom_proxy && selected_url == url;
-            choices = choices.child(
-                Button::new(format!("form-managed-{}", record.id))
-                    .w_full()
-                    .small()
-                    .when(selected, |button| button.primary())
-                    .when(!selected, |button| button.outline())
-                    .label(format!("{} · {}", record.name, record.url))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_form_managed_proxy(&url, window, cx)
-                    })),
-            );
-        }
-        v_flex()
-            .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("从代理管理中选择"),
-            )
-            .child(choices)
-            .into_any_element()
-    }
-
     fn render_dialog(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let dialog = self.dialog.clone();
         if matches!(dialog, Dialog::None) {
@@ -4106,32 +4122,14 @@ impl BrowserHome {
                         .gap_2()
                         .child(div().w(px(100.)).text_sm().child("代理"))
                         .child(
-                            Button::new("form-proxy-mode")
-                                .outline()
-                                .small()
-                                .label(if self.form_custom_proxy {
-                                    "独立配置"
-                                } else {
-                                    "跟随全局"
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.form_custom_proxy = !this.form_custom_proxy;
-                                    cx.notify();
-                                })),
+                            div()
+                                .flex_1()
+                                .child(Select::new(&self.form_proxy_select).w_full()),
                         ),
                 )
-                .child(if self.form_custom_proxy {
-                    form_field("SOCKS5", &self.form_proxy, cx)
-                } else {
-                    div().into_any_element()
-                })
-                .child(self.render_form_managed_proxies(cx))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(MUTED))
-                        .child("修改代理后，启动时仍会校验出口地区；已固定的浏览器指纹保持不变。"),
-                )
+                .child(div().text_xs().text_color(rgb(MUTED)).child(
+                    "修改代理后，启动时仍会校验出口国家和时区；已固定的浏览器指纹保持不变。",
+                ))
                 .into_any_element(),
             Dialog::Delete(id) => div()
                 .text_color(rgb(INK))
@@ -4687,8 +4685,54 @@ fn format_date(timestamp: u64) -> String {
 mod launch_tests {
     use std::path::PathBuf;
 
-    use super::LaunchUi;
+    use super::{LaunchUi, ProfileProxySelection, profile_proxy_choice, profile_proxy_options};
     use rust_browser::launch_progress::{LaunchEvent, LaunchStage};
+    use rust_browser::profiles::ProxyChoice;
+    use rust_browser::proxy::ProxySettings;
+    use rust_browser::proxy_management::{ManagedProxy, ProxyPolicy};
+
+    #[test]
+    fn proxy_dropdown_combines_global_and_managed_with_existing_fallback() {
+        let global = ProxySettings::parse("socks5://127.0.0.1:12334").unwrap();
+        let managed = vec![ManagedProxy {
+            id: "fr".into(),
+            name: "法国代理".into(),
+            url: "socks5://proxy.example:1080".into(),
+            credentials: None,
+            policy: ProxyPolicy::AllowParallel,
+            ip_switch: None,
+        }];
+        let options = profile_proxy_options(&global, &managed, None);
+        assert_eq!(options.len(), 2);
+        assert!(matches!(options[0].value, ProfileProxySelection::Global));
+        assert_eq!(
+            options[1].value,
+            ProfileProxySelection::Managed("fr".into())
+        );
+        assert!(matches!(
+            profile_proxy_choice(&options[1].value, &managed).unwrap(),
+            ProxyChoice::Custom(url) if url == "socks5://proxy.example:1080"
+        ));
+        assert_eq!(
+            profile_proxy_options(
+                &global,
+                &managed,
+                Some(&ProxyChoice::Custom("socks5://proxy.example:1080".into()))
+            )
+            .len(),
+            2
+        );
+        let existing = profile_proxy_options(
+            &global,
+            &managed,
+            Some(&ProxyChoice::Custom("socks5://other.example:1080".into())),
+        );
+        assert_eq!(existing.len(), 3);
+        assert!(matches!(
+            profile_proxy_choice(&existing[2].value, &managed).unwrap(),
+            ProxyChoice::Custom(url) if url == "socks5://other.example:1080"
+        ));
+    }
 
     #[test]
     fn close_step_only_appears_when_reported() {

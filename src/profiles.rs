@@ -74,7 +74,7 @@ pub struct CreateProfile {
     pub tabs: Vec<String>,
     pub proxy: ProxyChoice,
     /// None uses the proxy's detected GeoIP. Some overrides editable fields
-    /// while keeping the observed proxy IP and enforcing exit-region identity.
+    /// while keeping the observed proxy IP and enforcing country/timezone identity.
     pub geo: Option<ProfileGeoInput>,
 }
 
