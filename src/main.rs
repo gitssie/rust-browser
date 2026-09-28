@@ -26,7 +26,9 @@ use rust_browser::browser_manager::{
 use rust_browser::geo::ProfileGeo;
 use rust_browser::launch_progress::{LaunchEvent, LaunchProgressWriter, LaunchStage};
 use rust_browser::paths::AppPaths as Paths;
-use rust_browser::profiles::{CreateProfile, ProfileOs, ProfileService, ProxyChoice};
+use rust_browser::profiles::{
+    CreateProfile, ProfileOs, ProfileScreen, ProfileService, ProxyChoice,
+};
 use rust_browser::proxy::ProxySettings;
 use rust_browser::proxy_management::{
     IpSwitch, ManagedProxy, ProxyCatalog, ProxyPolicy, SwitchMethod,
@@ -357,10 +359,13 @@ fn profile_proxy(
     root: &Path,
     persona: &PersonaRecord,
     global_proxy: &ProxySettings,
-) -> Result<ProxySettings> {
+) -> Result<Option<ProxySettings>> {
     match persona.metadata.get("proxy_mode").and_then(Value::as_str) {
-        Some("custom") => ProxyCatalog::new(root).resolve_url(metadata_str(persona, "proxy_url")?),
-        Some("global") | None => Ok(global_proxy.clone()),
+        Some("custom") => ProxyCatalog::new(root)
+            .resolve_url(metadata_str(persona, "proxy_url")?)
+            .map(Some),
+        Some("direct") => Ok(None),
+        Some("global") | None => Ok(Some(global_proxy.clone())),
         Some(other) => bail!("invalid proxy mode: {other}"),
     }
 }
@@ -426,15 +431,16 @@ async fn open(
     } else {
         targets
     };
-    // A missing proxy must never turn this launch into direct traffic.
     progress.stage(LaunchStage::CheckProxy, None)?;
-    proxy.check().await?;
+    if let Some(proxy) = &proxy {
+        proxy.check().await?;
+    }
     let proxy_guard =
         if persona.metadata.get("proxy_mode").and_then(Value::as_str) == Some("custom") {
             prepare_browser_launch_with_progress(
                 paths.root(),
                 id,
-                &proxy,
+                proxy.as_ref().expect("custom proxy resolved"),
                 &global_proxy.browser_url(),
                 |stage, detail| progress.stage(stage, detail),
             )
@@ -443,7 +449,7 @@ async fn open(
             None
         };
     progress.stage(LaunchStage::GeoIp, None)?;
-    let (saved_geo, _) = checked_location_with_progress(&persona, id, &proxy, || {
+    let (saved_geo, _) = checked_location_with_progress(&persona, id, proxy.as_ref(), || {
         progress.stage(LaunchStage::VerifyGeo, None)
     })
     .await?;
@@ -453,11 +459,20 @@ async fn open(
     let installation = browser_manager.prepare_active()?;
     println!(
         "Opening {id} via {}: {}",
-        proxy.browser_url(),
+        proxy
+            .as_ref()
+            .map_or_else(|| "direct".into(), ProxySettings::browser_url),
         targets.join(", ")
     );
-    let mut options =
-        pinned_launch_options(paths, id, &mut persona, &saved_geo, &proxy, &installation).await?;
+    let mut options = pinned_launch_options(
+        paths,
+        id,
+        &mut persona,
+        &saved_geo,
+        proxy.as_ref(),
+        &installation,
+    )
+    .await?;
     options.args = targets;
     let runtime_listener = BrowserRuntime::new(paths.root()).bind(id).await?;
     let mut browser = launch(&options).await?;
@@ -468,6 +483,14 @@ async fn open(
             if let Some(status) = browser.child.try_wait()? {
                 bail!("browser exited during startup: {status}");
             }
+            let mut opened = storage::open_store(paths.root())?.require(id).await?;
+            opened.metadata.insert(
+                "last_opened_at".into(),
+                json!(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs()),
+            );
+            storage::open_store(paths.root())?.save(&opened).await?;
             progress.emit(LaunchEvent::Ready)?;
             println!("Browser PID: {:?}. Close the browser to exit.", browser.id());
             let status = browser.wait().await?;
@@ -522,15 +545,29 @@ fn launch_options(
     paths: &Paths,
     id: &str,
     persona: PersonaRecord,
-    proxy: &ProxySettings,
+    proxy: Option<&ProxySettings>,
     installation: &ActiveInstallation,
 ) -> Result<LaunchOptions> {
+    let ff_version = persona
+        .metadata
+        .get("firefox_version")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            installation
+                .version
+                .full_string()
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        });
     let mut options = LaunchOptions {
         os: vec![persona_os(&persona)?],
         persona: Some(persona),
         i_know_what_im_doing: true,
         persistent_profile: Some(paths.profile(id)),
-        proxy: Some(ProxyConfig {
+        proxy: proxy.map(|proxy| ProxyConfig {
             server: proxy.browser_url(),
             username: proxy
                 .credentials()
@@ -547,19 +584,17 @@ fn launch_options(
         // macOS's Resources/../MacOS path must be normalized for XPCOM loading.
         executable_path: Some(installation.executable_path.clone()),
         install_root: Some(installation.root.clone()),
-        ff_version: Some(
-            installation
-                .version
-                .full_string()
-                .split('.')
-                .next()
-                .unwrap_or_default()
-                .to_string(),
-        ),
+        ff_version: Some(ff_version),
         ..Default::default()
     };
     // Apply proxy prefs before Firefox's startup networking.
-    proxy.apply_firefox_prefs(&mut options.firefox_user_prefs);
+    if let Some(proxy) = proxy {
+        proxy.apply_firefox_prefs(&mut options.firefox_user_prefs);
+    } else {
+        options
+            .firefox_user_prefs
+            .insert("network.proxy.type".into(), json!(0));
+    }
     // Camoufox 152 declares canvas:seed, but Firefox's baseline protection
     // still adds a fresh per-process image-export salt. Disable that layer so
     // the saved canvas/font configuration remains observable across launches.
@@ -570,12 +605,33 @@ fn launch_options(
     Ok(options)
 }
 
+fn apply_prepared_proxy(prepared: &mut PreparedLaunch, proxy: Option<&ProxySettings>) {
+    prepared.proxy = proxy.map(ProxySettings::browser_url);
+    if let Some(proxy) = proxy {
+        proxy.apply_firefox_prefs(&mut prepared.firefox_user_prefs);
+    } else {
+        prepared
+            .firefox_user_prefs
+            .insert("network.proxy.type".into(), json!(0));
+        for key in [
+            "network.proxy.socks",
+            "network.proxy.socks_port",
+            "network.proxy.socks_version",
+            "network.proxy.socks_remote_dns",
+            "network.proxy.no_proxies_on",
+            "network.proxy.allow_hijacking_localhost",
+        ] {
+            prepared.firefox_user_prefs.remove(key);
+        }
+    }
+}
+
 async fn pinned_launch_options(
     paths: &Paths,
     id: &str,
     persona: &mut PersonaRecord,
     geo: &ProfileGeo,
-    proxy: &ProxySettings,
+    proxy: Option<&ProxySettings>,
     installation: &ActiveInstallation,
 ) -> Result<LaunchOptions> {
     let mut options = launch_options(paths, id, persona.clone(), proxy, installation)?;
@@ -596,8 +652,7 @@ async fn pinned_launch_options(
         }
         prepared.executable_path = saved_executable;
         let viewport_changed = use_native_viewport(paths, &mut prepared)?;
-        prepared.proxy = Some(proxy.browser_url());
-        proxy.apply_firefox_prefs(&mut prepared.firefox_user_prefs);
+        apply_prepared_proxy(&mut prepared, proxy);
         if viewport_changed {
             persona
                 .metadata
@@ -612,7 +667,7 @@ async fn pinned_launch_options(
         use_native_viewport(paths, &mut prepared)?;
         // Authentication belongs to the general proxy setting. A pinned
         // fingerprint must not retain an old proxy password.
-        prepared.proxy = Some(proxy.browser_url());
+        apply_prepared_proxy(&mut prepared, proxy);
         persona
             .metadata
             .insert("pinned_launch".into(), serde_json::to_value(&prepared)?);
@@ -632,9 +687,33 @@ async fn pinned_launch_options(
 
 /// Keep screen identity pinned while the page viewport follows native resizes.
 fn use_native_viewport(paths: &Paths, prepared: &mut PreparedLaunch) -> Result<bool> {
+    let screen = std::env::var("RUST_BROWSER_DISPLAY_SCREEN")
+        .ok()
+        .map(|encoded| serde_json::from_str::<ProfileScreen>(&encoded))
+        .transpose()
+        .context("invalid display screen dimensions")?;
+    use_native_viewport_with_screen(paths, prepared, screen)
+}
+
+fn use_native_viewport_with_screen(
+    paths: &Paths,
+    prepared: &mut PreparedLaunch,
+    screen: Option<ProfileScreen>,
+) -> Result<bool> {
     let mut changed = false;
     for key in WINDOW_DIM_KEYS {
         changed |= prepared.config.remove(*key).is_some();
+    }
+    if let Some(screen) = screen {
+        if screen.width < 800
+            || screen.height < 600
+            || screen.avail_width > screen.width
+            || screen.avail_height > screen.height
+        {
+            bail!("invalid display screen dimensions");
+        }
+        screen.apply_to_config(&mut prepared.config);
+        changed = true;
     }
     prepared.spoofs_window_dimensions = false;
     if changed {
@@ -659,7 +738,7 @@ fn use_native_viewport(paths: &Paths, prepared: &mut PreparedLaunch) -> Result<b
 async fn checked_location(
     persona: &PersonaRecord,
     id: &str,
-    proxy: &ProxySettings,
+    proxy: Option<&ProxySettings>,
 ) -> Result<(ProfileGeo, ProfileGeo)> {
     checked_location_with_progress(persona, id, proxy, || Ok(())).await
 }
@@ -667,14 +746,14 @@ async fn checked_location(
 async fn checked_location_with_progress(
     persona: &PersonaRecord,
     id: &str,
-    proxy: &ProxySettings,
+    proxy: Option<&ProxySettings>,
     report_verification: impl FnOnce() -> Result<()>,
 ) -> Result<(ProfileGeo, ProfileGeo)> {
     let saved: ProfileGeo =
         serde_json::from_value(persona.metadata.get("geo").cloned().with_context(|| {
             format!("profile {id} has no saved location; run `browserctl-rs refresh {id}`")
         })?)?;
-    let current = ProfileGeo::lookup(proxy).await?;
+    let current = ProfileGeo::lookup_with_proxy(proxy).await?;
     report_verification()?;
     let changes = saved.changes_from(&current);
     if !changes.is_empty() {
@@ -747,13 +826,15 @@ async fn refresh(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Resul
     let _lock = profile_lock(paths, id)?;
     let mut persona = storage::open_store(paths.root())?.require(id).await?;
     let proxy = profile_proxy(paths.root(), &persona, global_proxy)?;
-    proxy.check().await?;
-    let geo = ProfileGeo::lookup(&proxy).await?;
+    if let Some(proxy) = &proxy {
+        proxy.check().await?;
+    }
+    let geo = ProfileGeo::lookup_with_proxy(proxy.as_ref()).await?;
     if let Some(value) = persona.metadata.get("pinned_launch") {
         let mut prepared: PreparedLaunch = serde_json::from_value(value.clone())?;
         update_launch_geo(paths, &mut prepared, &geo)?;
         use_native_viewport(paths, &mut prepared)?;
-        prepared.proxy = Some(proxy.browser_url());
+        apply_prepared_proxy(&mut prepared, proxy.as_ref());
         persona
             .metadata
             .insert("pinned_launch".into(), serde_json::to_value(prepared)?);
@@ -822,13 +903,15 @@ async fn scan(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Result<(
     let _lock = profile_lock(paths, id)?;
     let mut persona = storage::open_store(paths.root())?.require(id).await?;
     let proxy = profile_proxy(paths.root(), &persona, global_proxy)?;
-    proxy.check().await?;
+    if let Some(proxy) = &proxy {
+        proxy.check().await?;
+    }
     let proxy_guard =
         if persona.metadata.get("proxy_mode").and_then(Value::as_str) == Some("custom") {
             prepare_browser_launch_with_progress(
                 paths.root(),
                 id,
-                &proxy,
+                proxy.as_ref().expect("custom proxy resolved"),
                 &global_proxy.browser_url(),
                 |_, _| Ok(()),
             )
@@ -836,13 +919,20 @@ async fn scan(paths: &Paths, id: &str, global_proxy: &ProxySettings) -> Result<(
         } else {
             None
         };
-    let (saved_geo, current_geo) = checked_location(&persona, id, &proxy).await?;
+    let (saved_geo, current_geo) = checked_location(&persona, id, proxy.as_ref()).await?;
     let expected_ip = current_geo.ip;
     let browser_manager = BrowserManager::with_paths(paths.clone());
     let _browser_guard = browser_manager.runtime_guard()?;
     let installation = browser_manager.prepare_active()?;
-    let options =
-        pinned_launch_options(paths, id, &mut persona, &saved_geo, &proxy, &installation).await?;
+    let options = pinned_launch_options(
+        paths,
+        id,
+        &mut persona,
+        &saved_geo,
+        proxy.as_ref(),
+        &installation,
+    )
+    .await?;
     let runtime_listener = BrowserRuntime::new(paths.root()).bind(id).await?;
     let mut browser = launch_with_juggler(&options).await?;
     drop(proxy_guard);
@@ -1044,7 +1134,7 @@ async fn run(cli: Cli) -> Result<()> {
                 "os": metadata_str(&persona, "os")?,
                 "startup_tabs": startup_tabs(&persona)?,
                 "proxy_mode": persona.metadata.get("proxy_mode").and_then(Value::as_str).unwrap_or("global"),
-                "proxy": proxy.browser_url(),
+                "proxy": proxy.as_ref().map(ProxySettings::browser_url),
                 "saved_geo": persona.metadata.get("geo"),
                 "profile_dir": paths.profile(&id),
                 "user_agent": persona.fingerprint.fingerprint.navigator.user_agent,
@@ -1173,6 +1263,33 @@ mod tests {
     use rust_browser::launch_progress::read_events;
 
     #[test]
+    fn direct_launch_clears_saved_proxy_preferences() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let proxy = ProxySettings::parse("socks5://127.0.0.1:12334").unwrap();
+        let mut prepared = PreparedLaunch {
+            executable_path: paths.browser().join("camoufox.exe"),
+            env: BTreeMap::new(),
+            firefox_user_prefs: BTreeMap::new(),
+            args: Vec::new(),
+            proxy: None,
+            proxy_bypass: None,
+            spoofs_window_dimensions: false,
+            config: Default::default(),
+        };
+        apply_prepared_proxy(&mut prepared, Some(&proxy));
+        assert_eq!(prepared.proxy.as_deref(), Some("socks5://127.0.0.1:12334"));
+        apply_prepared_proxy(&mut prepared, None);
+        assert!(prepared.proxy.is_none());
+        assert_eq!(prepared.firefox_user_prefs["network.proxy.type"], json!(0));
+        assert!(
+            !prepared
+                .firefox_user_prefs
+                .contains_key("network.proxy.socks")
+        );
+    }
+
+    #[test]
     fn native_viewport_keeps_screen_identity_but_removes_fixed_window_size() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
@@ -1210,6 +1327,26 @@ mod tests {
         assert_eq!(encoded["screen.width"], 1920);
         assert!(encoded.get("window.innerWidth").is_none());
         assert!(!use_native_viewport(&paths, &mut prepared).unwrap());
+
+        let screen = ProfileScreen {
+            width: 2560,
+            height: 1440,
+            avail_width: 2560,
+            avail_height: 1400,
+            avail_left: 0,
+            avail_top: 40,
+        };
+        assert!(use_native_viewport_with_screen(&paths, &mut prepared, Some(screen)).unwrap());
+        assert_eq!(prepared.config.get("screen.width"), Some(&json!(2560)));
+        assert_eq!(prepared.config.get("screen.height"), Some(&json!(1440)));
+        assert_eq!(
+            prepared.config.get("screen.availHeight"),
+            Some(&json!(1400))
+        );
+        let encoded: serde_json::Value =
+            serde_json::from_str(&prepared.env["CAMOU_CONFIG_1"]).unwrap();
+        assert_eq!(encoded["screen.width"], 2560);
+        assert_eq!(encoded["screen.availHeight"], 1400);
     }
 
     #[test]

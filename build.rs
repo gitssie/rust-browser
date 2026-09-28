@@ -3,6 +3,12 @@ fn main() {
         return;
     }
 
+    println!("cargo:rerun-if-changed=assets/CazerBrowser.ico");
+    winresource::WindowsResource::new()
+        .set_icon("assets/CazerBrowser.ico")
+        .compile()
+        .expect("embed Cazer Browser icon in Windows executable");
+
     // GPUI's debug-mode window rendering can exceed the Windows executable's
     // small default main-thread stack. This reserves virtual address space;
     // pages are committed only as the stack grows.

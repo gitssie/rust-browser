@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="cazer-green" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#006978"/>
+      <stop offset="0.53" stop-color="#00a78f"/>
+      <stop offset="1" stop-color="#45efb6"/>
+    </linearGradient>
+    <linearGradient id="cazer-dot" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#00bc93"/>
+      <stop offset="1" stop-color="#50f5bd"/>
+    </linearGradient>
+  </defs>
+  <path d="M 765 269 A 360 360 0 1 0 765 755"
+        fill="none" stroke="url(#cazer-green)" stroke-width="178" stroke-linecap="round"/>
+  <circle cx="847" cy="512" r="80" fill="url(#cazer-dot)"/>
+</svg>

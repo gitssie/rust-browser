@@ -24,6 +24,7 @@ fs2 = "0.4"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "c6a68e0cfd5f8b694a5f1a31d33abaad56226a4d" }
+gpui-base = { git = "https://github.com/longbridge/gpui-component", rev = "c6a68e0cfd5f8b694a5f1a31d33abaad56226a4d" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "c6a68e0cfd5f8b694a5f1a31d33abaad56226a4d" }
 libc = "0.2"
 rand = "0.8"
@@ -41,6 +42,15 @@ url = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage", "NSMenu", "NSMenuItem", "NSToolbar", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData", "NSString"] }
+raw-window-handle = "0.6"
+
+[build-dependencies]
+winresource = "0.1.31"
 
 [dev-dependencies]
 zip = "2"

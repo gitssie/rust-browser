@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use camoufox_core::fingerprint::FingerprintRequest;
+use camoufox_core::fingerprint::{FingerprintRequest, ScreenConstraints};
 use camoufox_core::locale::normalize_locale;
 use camoufox_core::os::SupportedOs;
 use camoufox_core::persona::PersonaRecord;
@@ -57,10 +57,11 @@ impl ProfileOs {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", content = "url", rename_all = "lowercase")]
 pub enum ProxyChoice {
     Global,
+    Direct,
     Custom(String),
 }
 
@@ -76,6 +77,32 @@ pub struct CreateProfile {
     /// None uses the proxy's detected GeoIP. Some overrides editable fields
     /// while keeping the observed proxy IP and enforcing country/timezone identity.
     pub geo: Option<ProfileGeoInput>,
+    pub screen: Option<ProfileScreen>,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ProfileScreen {
+    pub width: u32,
+    pub height: u32,
+    pub avail_width: u32,
+    pub avail_height: u32,
+    pub avail_left: u32,
+    pub avail_top: u32,
+}
+
+impl ProfileScreen {
+    pub fn apply_to_config(self, config: &mut serde_json::Map<String, serde_json::Value>) {
+        for (key, value) in [
+            ("screen.width", self.width),
+            ("screen.height", self.height),
+            ("screen.availWidth", self.avail_width),
+            ("screen.availHeight", self.avail_height),
+            ("screen.availLeft", self.avail_left),
+            ("screen.availTop", self.avail_top),
+        ] {
+            config.insert(key.into(), json!(value));
+        }
+    }
 }
 
 impl CreateProfile {
@@ -93,7 +120,13 @@ impl CreateProfile {
             tabs,
             proxy,
             geo,
+            screen: None,
         }
+    }
+
+    pub fn with_screen(mut self, screen: Option<ProfileScreen>) -> Self {
+        self.screen = screen;
+        self
     }
 }
 
@@ -218,6 +251,8 @@ pub enum ProxyModeFilter {
 #[derive(Clone, Debug, Default)]
 pub struct ProfileListFilter {
     pub proxy_mode: Option<ProxyModeFilter>,
+    /// Match the exact configured proxy, including Global as its own choice.
+    pub proxy: Option<ProxyChoice>,
     /// Profiles matching any of these tags are returned.
     pub tags: Vec<String>,
 }
@@ -246,6 +281,7 @@ pub struct ProfileView {
     pub id: String,
     pub name: Option<String>,
     pub created_at: u64,
+    pub last_opened_at: Option<u64>,
     pub os: String,
     pub tabs: Vec<String>,
     pub tags: Vec<String>,
@@ -339,11 +375,13 @@ impl ProfileService {
         Ok(file)
     }
 
-    fn resolve_proxy(&self, choice: &ProxyChoice) -> ProfileResult<ProxySettings> {
+    fn resolve_proxy(&self, choice: &ProxyChoice) -> ProfileResult<Option<ProxySettings>> {
         match choice {
-            ProxyChoice::Global => Ok(self.global_proxy.clone()),
+            ProxyChoice::Global => Ok(Some(self.global_proxy.clone())),
+            ProxyChoice::Direct => Ok(None),
             ProxyChoice::Custom(url) => ProxyCatalog::new(self.paths.root())
                 .resolve_url(url)
+                .map(Some)
                 .map_err(|error| ProfileError::Invalid(error.to_string())),
         }
     }
@@ -351,6 +389,7 @@ impl ProfileService {
     fn choice(record: &PersonaRecord) -> ProfileResult<ProxyChoice> {
         match record.metadata.get("proxy_mode").and_then(Value::as_str) {
             Some("global") | None => Ok(ProxyChoice::Global),
+            Some("direct") => Ok(ProxyChoice::Direct),
             Some("custom") => Ok(ProxyChoice::Custom(
                 record
                     .metadata
@@ -373,9 +412,12 @@ impl ProfileService {
     fn view(&self, record: &PersonaRecord) -> ProfileResult<ProfileView> {
         let choice = Self::choice(record)?;
         let proxy = match &choice {
-            ProxyChoice::Global => self.global_proxy.clone(),
-            ProxyChoice::Custom(url) => ProxySettings::parse(url)
-                .map_err(|error| ProfileError::Invalid(error.to_string()))?,
+            ProxyChoice::Global => Some(self.global_proxy.clone()),
+            ProxyChoice::Direct => None,
+            ProxyChoice::Custom(url) => Some(
+                ProxySettings::parse(url)
+                    .map_err(|error| ProfileError::Invalid(error.to_string()))?,
+            ),
         };
         let geo = record.metadata.get("geo").cloned().ok_or_else(|| {
             ProfileError::Storage(anyhow::anyhow!("profile {} has no saved geo", record.id))
@@ -388,6 +430,10 @@ impl ProfileService {
             id: record.id.clone(),
             name: record.name.clone(),
             created_at: record.created_at,
+            last_opened_at: record
+                .metadata
+                .get("last_opened_at")
+                .and_then(Value::as_u64),
             os: record
                 .metadata
                 .get("os")
@@ -397,7 +443,7 @@ impl ProfileService {
             tabs,
             tags,
             proxy: choice,
-            effective_proxy: proxy.browser_url(),
+            effective_proxy: proxy.map_or_else(|| "direct".into(), |proxy| proxy.browser_url()),
             saved_geo,
             browser_data_dir: self.browser_data_dir(&record.id),
             user_agent: record.fingerprint.fingerprint.navigator.user_agent.clone(),
@@ -412,8 +458,10 @@ impl ProfileService {
         let name = input.name.as_deref().map(validate_name).transpose()?;
         let tabs = validate_tabs(&input.tabs)?;
         let proxy = self.resolve_proxy(&input.proxy)?;
-        proxy.check().await.map_err(ProfileError::Proxy)?;
-        let observed = ProfileGeo::lookup(&proxy)
+        if let Some(proxy) = &proxy {
+            proxy.check().await.map_err(ProfileError::Proxy)?;
+        }
+        let observed = ProfileGeo::lookup_with_proxy(proxy.as_ref())
             .await
             .map_err(ProfileError::Proxy)?;
         let geo = match input.geo.clone() {
@@ -462,20 +510,39 @@ impl ProfileService {
         }
         let request = FingerprintRequest {
             operating_systems: Some(vec![input.os.supported()]),
+            screen: Some(ScreenConstraints {
+                min_width: Some(1280),
+                min_height: Some(720),
+                ..Default::default()
+            }),
             seed: Some(rand::thread_rng().r#gen::<u64>()),
             ..Default::default()
         };
         let mut record = PersonaRecord::generate(id, &request).map_err(storage)?;
+        if let Some(screen) = input.screen {
+            let fingerprint_screen = &mut record.fingerprint.fingerprint.screen;
+            fingerprint_screen.width = screen.width;
+            fingerprint_screen.height = screen.height;
+            fingerprint_screen.avail_width = screen.avail_width;
+            fingerprint_screen.avail_height = screen.avail_height;
+            fingerprint_screen.avail_left = Some(screen.avail_left);
+            fingerprint_screen.avail_top = Some(screen.avail_top);
+        }
         record.name = Some(name.unwrap_or_else(|| id.to_string()));
         record
             .metadata
             .insert("os".into(), json!(input.os.supported().as_str()));
         record.metadata.insert("tabs".into(), json!(tabs));
         record.metadata.insert("geo".into(), json!(geo));
+        const FIREFOX_VERSIONS: [&str; 3] = ["151", "152", "153"];
+        let version = FIREFOX_VERSIONS[rand::thread_rng().gen_range(0..FIREFOX_VERSIONS.len())];
+        record
+            .metadata
+            .insert("firefox_version".into(), json!(version));
         set_choice(
             &mut record,
             &input.proxy,
-            &self.resolve_proxy(&input.proxy)?,
+            self.resolve_proxy(&input.proxy)?.as_ref(),
         );
         store.save(&record).await.map_err(storage)?;
         self.view(&record)
@@ -527,27 +594,26 @@ impl ProfileService {
                     .to_lowercase()
                     .contains(&search)
         });
-        if !filter_tags.is_empty() || filter.proxy_mode.is_some() {
+        if !filter_tags.is_empty() || filter.proxy_mode.is_some() || filter.proxy.is_some() {
             let mut filtered = Vec::new();
             for summary in summaries {
                 let Some(record) = store.load(&summary.id).await.map_err(storage)? else {
                     continue;
                 };
+                let choice = Self::choice(&record)?;
                 let proxy_matches = match filter.proxy_mode {
                     None => true,
-                    Some(ProxyModeFilter::Global) => {
-                        matches!(Self::choice(&record)?, ProxyChoice::Global)
-                    }
-                    Some(ProxyModeFilter::Custom) => {
-                        matches!(Self::choice(&record)?, ProxyChoice::Custom(_))
-                    }
+                    Some(ProxyModeFilter::Global) => matches!(choice, ProxyChoice::Global),
+                    Some(ProxyModeFilter::Custom) => matches!(choice, ProxyChoice::Custom(_)),
                 };
+                let exact_proxy_matches =
+                    filter.proxy.as_ref().is_none_or(|proxy| *proxy == choice);
                 let tags = saved_tags(&record)?;
                 let tag_matches = filter_tags.is_empty()
                     || filter_tags
                         .iter()
                         .any(|selected| tags.iter().any(|tag| tag.eq_ignore_ascii_case(selected)));
-                if proxy_matches && tag_matches {
+                if proxy_matches && exact_proxy_matches && tag_matches {
                     filtered.push(summary);
                 }
             }
@@ -678,7 +744,7 @@ impl ProfileService {
             record.metadata.insert("tags".into(), json!(tags));
         }
         if let (Some(choice), Some(proxy)) = (input.proxy.as_ref(), proxy.as_ref()) {
-            set_choice(&mut record, choice, proxy);
+            set_choice(&mut record, choice, proxy.as_ref());
         }
         store.save(&record).await.map_err(storage)?;
         self.view(&record)
@@ -725,17 +791,22 @@ impl ProfileService {
     }
 }
 
-fn set_choice(record: &mut PersonaRecord, choice: &ProxyChoice, proxy: &ProxySettings) {
+fn set_choice(record: &mut PersonaRecord, choice: &ProxyChoice, proxy: Option<&ProxySettings>) {
     match choice {
         ProxyChoice::Global => {
             record.metadata.insert("proxy_mode".into(), json!("global"));
             record.metadata.remove("proxy_url");
         }
+        ProxyChoice::Direct => {
+            record.metadata.insert("proxy_mode".into(), json!("direct"));
+            record.metadata.remove("proxy_url");
+        }
         ProxyChoice::Custom(_) => {
             record.metadata.insert("proxy_mode".into(), json!("custom"));
-            record
-                .metadata
-                .insert("proxy_url".into(), json!(proxy.browser_url()));
+            record.metadata.insert(
+                "proxy_url".into(),
+                json!(proxy.expect("custom proxy resolved").browser_url()),
+            );
         }
     }
 }
@@ -887,7 +958,42 @@ mod tests {
             tabs: vec!["https://www.vinted.fr/".into()],
             proxy,
             geo: None,
+            screen: None,
         }
+    }
+
+    #[tokio::test]
+    async fn created_profile_uses_display_screen_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProfileService::new(dir.path(), "socks5://127.0.0.1:12334").unwrap();
+        let screen = ProfileScreen {
+            width: 2560,
+            height: 1440,
+            avail_width: 2560,
+            avail_height: 1400,
+            avail_left: 0,
+            avail_top: 40,
+        };
+        service
+            .create_with_geo(
+                input("screen-profile", "Screen", ProxyChoice::Global).with_screen(Some(screen)),
+                Some("Screen".into()),
+                vec!["https://example.com/".into()],
+                geo(),
+            )
+            .await
+            .unwrap();
+        let record = service
+            .store()
+            .unwrap()
+            .load("screen-profile")
+            .await
+            .unwrap()
+            .unwrap();
+        let saved = &record.fingerprint.fingerprint.screen;
+        assert_eq!((saved.width, saved.height), (2560, 1440));
+        assert_eq!((saved.avail_width, saved.avail_height), (2560, 1400));
+        assert_eq!((saved.avail_left, saved.avail_top), (Some(0), Some(40)));
     }
 
     #[tokio::test]
@@ -919,6 +1025,33 @@ mod tests {
                     .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn last_opened_time_is_read_from_persisted_profile_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProfileService::new(dir.path(), "socks5://127.0.0.1:12334").unwrap();
+        let profile = service
+            .create_with_verified_geo(
+                input("recent-open", "Recent", ProxyChoice::Global),
+                None,
+                Vec::new(),
+                geo(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(profile.last_opened_at, None);
+
+        let store = service.store().unwrap();
+        let mut record = store.require(&profile.id).await.unwrap();
+        record
+            .metadata
+            .insert("last_opened_at".into(), json!(1_700_000_000_u64));
+        store.save(&record).await.unwrap();
+
+        let loaded = service.get(&profile.id).await.unwrap();
+        assert_eq!(loaded.last_opened_at, Some(1_700_000_000));
+        assert_eq!(loaded.created_at, profile.created_at);
     }
 
     #[tokio::test]
@@ -986,9 +1119,56 @@ mod tests {
         let custom = service
             .resolve_proxy(&ProxyChoice::Custom("socks5://proxy.example:1080".into()))
             .unwrap();
-        assert_eq!(custom.credentials(), Some(("alice", "secret")));
+        assert_eq!(custom.unwrap().credentials(), Some(("alice", "secret")));
         let global = service.resolve_proxy(&ProxyChoice::Global).unwrap();
-        assert_eq!(global.credentials(), None);
+        assert_eq!(global.unwrap().credentials(), None);
+        assert!(
+            service
+                .resolve_proxy(&ProxyChoice::Direct)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_choice_survives_create_and_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProfileService::new(dir.path(), "socks5://127.0.0.1:12334").unwrap();
+        let created = service
+            .create_with_geo(
+                input("direct-profile", "Direct", ProxyChoice::Direct),
+                Some("Direct".into()),
+                vec![],
+                geo(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.proxy, ProxyChoice::Direct);
+        assert_eq!(created.effective_proxy, "direct");
+        let record = service
+            .store()
+            .unwrap()
+            .load("direct-profile")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.metadata["proxy_mode"], "direct");
+        assert!(matches!(
+            record.metadata["firefox_version"].as_str(),
+            Some("151" | "152" | "153")
+        ));
+        assert!(record.metadata.get("proxy_url").is_none());
+        let updated = service
+            .update(
+                "direct-profile",
+                UpdateProfile {
+                    proxy: Some(ProxyChoice::Global),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.proxy, ProxyChoice::Global);
     }
 
     #[test]
@@ -1110,6 +1290,38 @@ mod tests {
             .await
             .unwrap();
         assert!(empty.items.is_empty());
+
+        let custom = service
+            .list_filtered(
+                ProfileQuery {
+                    search: None,
+                    page: 1,
+                    page_size: 1,
+                },
+                ProfileListFilter {
+                    proxy: Some(ProxyChoice::Custom("socks5://localhost:34567".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(custom.total, 1);
+        assert_eq!(custom.items[0].id, "beta");
+        let global = service
+            .list_filtered(
+                ProfileQuery {
+                    search: None,
+                    page: 1,
+                    page_size: 1,
+                },
+                ProfileListFilter {
+                    proxy: Some(ProxyChoice::Global),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!((global.total, global.total_pages), (2, 2));
 
         let updated = service
             .update(

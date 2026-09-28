@@ -44,15 +44,23 @@ struct IpWhoTimezone {
 
 impl ProfileGeo {
     pub async fn lookup(proxy: &ProxySettings) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(proxy.request_url())?)
-            .timeout(proxy.timeout())
-            .build()?;
+        Self::lookup_with_proxy(Some(proxy)).await
+    }
+
+    pub async fn lookup_with_proxy(proxy: Option<&ProxySettings>) -> Result<Self> {
+        let mut builder = reqwest::Client::builder()
+            .timeout(proxy.map_or(std::time::Duration::from_secs(10), ProxySettings::timeout));
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(reqwest::Proxy::all(proxy.request_url())?);
+        } else {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build()?;
         let response: IpWhoResponse = client
             .get("https://ipwho.is/")
             .send()
             .await
-            .context("ipwho.is could not verify the local proxy exit")?
+            .context("ipwho.is could not verify the network location")?
             .error_for_status()
             .context("ipwho.is returned an HTTP error")?
             .json()

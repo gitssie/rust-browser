@@ -14,15 +14,23 @@ use anyhow::{Context as _, Result, anyhow};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::{
-    Disableable, Icon, IconName, Root, Sizable, StyledExt, TitleBar,
-    button::{Button, ButtonVariants as _},
+    Disableable, Icon, IconName, Root, Sizable, StyledExt, Theme, WindowExt,
+    button::{Button, ButtonVariant, ButtonVariants as _},
     checkbox::Checkbox,
+    color_picker::{ColorPicker, ColorPickerState},
+    dialog::DialogButtonProps,
     h_flex,
     input::{Input, InputEvent, InputState},
+    notification::Notification,
+    popover::Popover,
     scroll::ScrollableElement,
     select::{Select, SelectEvent, SelectItem, SelectState},
+    spinner::Spinner,
+    switch::Switch,
+    theme::{Colorize as _, try_parse_color},
     v_flex,
 };
+use rand::Rng as _;
 use rust_browser::browser_manager::{
     BrowserManager, DownloadControl, DownloadProgress, DownloadStage, InstalledVersion, Release,
 };
@@ -31,8 +39,8 @@ use rust_browser::geo::ProfileGeo;
 use rust_browser::launch_progress::{LaunchEvent, LaunchStage, read_events};
 use rust_browser::paths::AppPaths;
 use rust_browser::profiles::{
-    CreateProfile, ProfileGeoInput, ProfileListFilter, ProfileOs, ProfileQuery, ProfileService,
-    ProfileView, ProxyChoice, ProxyModeFilter, UpdateProfile,
+    CreateProfile, ProfileGeoInput, ProfileListFilter, ProfileOs, ProfileQuery, ProfileScreen,
+    ProfileService, ProfileView, ProxyChoice, UpdateProfile,
 };
 use rust_browser::proxy::ProxySettings;
 use rust_browser::proxy_management::{
@@ -45,13 +53,131 @@ use rust_browser::workspace_lock::WorkspaceLock;
 
 use crate::Paths;
 
+#[path = "ui/assets.rs"]
+mod assets;
+#[path = "ui/browser_actions.rs"]
+mod browser_actions;
+#[path = "ui/cards.rs"]
+mod cards;
+#[path = "ui/dialogs.rs"]
+mod dialogs;
+#[path = "ui/home.rs"]
+mod home;
+#[path = "ui/management_theme.rs"]
+mod management_theme;
+#[path = "ui/notifications.rs"]
+mod notifications;
+#[path = "ui/profile_actions.rs"]
+mod profile_actions;
+#[path = "ui/settings_page.rs"]
+mod settings_page;
+#[path = "ui/tag_management.rs"]
+mod tag_management;
+use assets::app_logo;
+use management_theme::{management_add_button, management_row_button};
+
 const GREEN: u32 = 0x008c68;
-const GREEN_PALE: u32 = 0xe6f7ef;
-const INK: u32 = 0x172a3e;
+const GREEN_PALE: u32 = 0xd9f8ee;
+const INK: u32 = 0x101f58;
 const MUTED: u32 = 0x718197;
-const LINE: u32 = 0xe1e8ef;
+const LINE: u32 = 0xdce5f3;
 const ROW_ALT: u32 = 0xf8fbfd;
-const SELECTED: u32 = 0xeafaf5;
+const SELECTED: u32 = 0xe0f8f1;
+const PENCIL_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.4 2.6a2.1 2.1 0 0 1 3 3L12 15l-4 1 1-4Z"/></svg>"#;
+const TRASH_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1L5 6"/><path d="M10 11v6M14 11v6"/></svg>"#;
+const WINDOWS_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M2 4.5 10.7 3.3v8H2V4.5zm10.3-1.4L22 1.7v9.6h-9.7V3.1zM2 12.7h8.7v8L2 19.5v-6.8zm10.3 0H22v9.6l-9.7-1.4v-8.2z"/></svg>"#;
+const POWER_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/></svg>"#;
+const PLAY_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m10 8 6 4-6 4z"/></svg>"#;
+const NAV_BROWSER_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="18" rx="2"/><path d="M2 8h20"/></svg>"#;
+const NAV_PROXY_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/></svg>"#;
+const NAV_TAG_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h10l8 8-9 9-9-9V4Z"/><circle cx="8" cy="8" r="1"/></svg>"#;
+
+#[cfg(target_os = "macos")]
+actions!(cazer_browser, [Quit]);
+
+fn host_profile_os() -> ProfileOs {
+    if cfg!(target_os = "macos") {
+        ProfileOs::Macos
+    } else if cfg!(target_os = "windows") {
+        ProfileOs::Windows
+    } else {
+        ProfileOs::Linux
+    }
+}
+
+fn profile_screen(window: &Window, cx: &App) -> Option<ProfileScreen> {
+    let display = window.display(cx)?;
+    let bounds = display.bounds();
+    let visible = display.visible_bounds();
+    let dimension = |value: Pixels| f32::from(value).round().max(0.) as u32;
+    Some(ProfileScreen {
+        width: dimension(bounds.size.width),
+        height: dimension(bounds.size.height),
+        avail_width: dimension(visible.size.width),
+        avail_height: dimension(visible.size.height),
+        avail_left: dimension(visible.origin.x - bounds.origin.x),
+        avail_top: dimension(visible.origin.y - bounds.origin.y),
+    })
+}
+
+fn proxy_display_name(choice: &ProxyChoice, managed: &[ManagedProxy]) -> String {
+    match choice {
+        ProxyChoice::Global => "全局".into(),
+        ProxyChoice::Direct => "直连".into(),
+        ProxyChoice::Custom(url) => managed
+            .iter()
+            .find(|proxy| proxy.url == *url)
+            .map(|proxy| proxy.name.clone())
+            .unwrap_or_else(|| "自定义代理".into()),
+    }
+}
+
+fn tag_colors(tag: &str) -> (u32, u32) {
+    const PALETTE: [(u32, u32); 5] = [
+        (0xe8f1ff, 0x0069ed),
+        (0xffe8ee, 0xf02e65),
+        (0xf0e5ff, 0x9227eb),
+        (0xffeedf, 0xee6900),
+        (GREEN_PALE, GREEN),
+    ];
+    let hash = tag.as_bytes().iter().fold(2166136261_u32, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(16777619)
+    });
+    PALETTE[hash as usize % PALETTE.len()]
+}
+
+fn random_tag_color(used_colors: &HashMap<String, String>) -> Hsla {
+    const COLORS: [u32; 10] = [
+        0x2563eb, 0x7c3aed, 0xdb2777, 0xea580c, 0x0d9488, 0x16a34a, 0xca8a04, 0xdc2626, 0x0891b2,
+        0x4f46e5,
+    ];
+    let unused: Vec<_> = COLORS
+        .iter()
+        .copied()
+        .filter(|color| {
+            let hex = format!("#{color:06X}");
+            !used_colors
+                .values()
+                .any(|used| used.eq_ignore_ascii_case(&hex))
+        })
+        .collect();
+    let palette = if unused.is_empty() {
+        &COLORS[..]
+    } else {
+        &unused[..]
+    };
+    rgb(palette[rand::thread_rng().gen_range(0..palette.len())]).into()
+}
+
+fn country_flag(code: &str) -> String {
+    let code = code.to_ascii_uppercase();
+    if code.len() != 2 || !code.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        return "🌐".into();
+    }
+    code.bytes()
+        .filter_map(|byte| char::from_u32(0x1f1e6 + u32::from(byte - b'A')))
+        .collect()
+}
 
 fn mirror_launch_output(mut source: impl Read + Send + 'static, mut log: File, stderr: bool) {
     std::thread::spawn(move || {
@@ -129,13 +255,12 @@ enum Dialog {
     None,
     Create,
     Edit(String),
-    Delete(String),
-    CloseAll,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProfileProxySelection {
     Global,
+    Direct,
     Managed(String),
     ExistingCustom(String),
 }
@@ -163,10 +288,16 @@ fn profile_proxy_options(
     managed: &[ManagedProxy],
     current: Option<&ProxyChoice>,
 ) -> Vec<ProfileProxyOption> {
-    let mut options = vec![ProfileProxyOption {
-        label: format!("全局代理 · {}", global.browser_url()).into(),
-        value: ProfileProxySelection::Global,
-    }];
+    let mut options = vec![
+        ProfileProxyOption {
+            label: format!("全局代理 · {}", global.browser_url()).into(),
+            value: ProfileProxySelection::Global,
+        },
+        ProfileProxyOption {
+            label: "直连（不使用代理）".into(),
+            value: ProfileProxySelection::Direct,
+        },
+    ];
     options.extend(managed.iter().map(|proxy| ProfileProxyOption {
         label: format!("{} · {}", proxy.name, proxy.url).into(),
         value: ProfileProxySelection::Managed(proxy.id.clone()),
@@ -188,6 +319,7 @@ fn profile_proxy_choice(
 ) -> Result<ProxyChoice> {
     match selection {
         ProfileProxySelection::Global => Ok(ProxyChoice::Global),
+        ProfileProxySelection::Direct => Ok(ProxyChoice::Direct),
         ProfileProxySelection::Managed(id) => managed
             .iter()
             .find(|proxy| &proxy.id == id)
@@ -195,12 +327,6 @@ fn profile_proxy_choice(
             .ok_or_else(|| anyhow!("所选代理已不存在，请重新选择")),
         ProfileProxySelection::ExistingCustom(url) => Ok(ProxyChoice::Custom(url.clone())),
     }
-}
-
-#[derive(Clone)]
-enum TagPopup {
-    Filter,
-    Profile(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -261,31 +387,141 @@ pub fn run(
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx| {
         gpui_component::init(cx);
-        let bounds = Bounds::centered(None, size(px(1460.), px(900.)), cx);
-        let mut options = TitleBar::window_options();
+        {
+            let theme = Theme::global_mut(cx);
+            theme.primary = rgb(GREEN).into();
+            theme.primary_hover = rgb(0x007c5c).into();
+            theme.primary_active = rgb(0x006b50).into();
+            theme.button_primary = rgb(GREEN).into();
+            theme.button_primary_hover = rgb(0x007c5c).into();
+            theme.button_primary_active = rgb(0x006b50).into();
+            theme.tokens.primary = theme.primary.into();
+            theme.tokens.primary_hover = theme.primary_hover.into();
+            theme.tokens.primary_active = theme.primary_active.into();
+            theme.tokens.button_primary = theme.button_primary.into();
+            theme.tokens.button_primary_hover = theme.button_primary_hover.into();
+            theme.tokens.button_primary_active = theme.button_primary_active.into();
+        }
+        Theme::sync_base(cx);
+        cx.set_quit_mode(QuitMode::LastWindowClosed);
+        #[cfg(target_os = "macos")]
+        {
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.set_menus([
+                Menu::new("Cazer Browser").items([MenuItem::action("退出 Cazer Browser", Quit)])
+            ]);
+            cx.activate(true);
+            set_native_app_menu_name();
+            set_native_app_icon();
+        }
+        let bounds = Bounds::centered(None, size(px(1440.), px(840.)), cx);
+        let mut options = WindowOptions::default();
+        if let Some(titlebar) = options.titlebar.as_mut() {
+            titlebar.title = Some("Cazer Browser".into());
+        }
         options.window_bounds = Some(WindowBounds::Windowed(bounds));
         options.window_min_size = Some(size(px(1050.), px(600.)));
         options.app_id = Some("app.cazer.browser".into());
         cx.spawn(async move |cx| {
-            cx.open_window(options, move |window, cx| {
-                let home = cx.new(|cx| {
-                    BrowserHome::new(
-                        service,
-                        runtime,
-                        tokio,
-                        initial_settings,
-                        global_proxy,
-                        window,
-                        cx,
-                    )
-                });
-                cx.new(|cx| Root::new(home, window, cx))
-            })
-            .expect("open browser manager");
+            let window_handle = cx
+                .open_window(options, move |window, cx| {
+                    let home = cx.new(|cx| {
+                        BrowserHome::new(
+                            service,
+                            runtime,
+                            tokio,
+                            initial_settings,
+                            global_proxy,
+                            window,
+                            cx,
+                        )
+                    });
+                    let root = cx.new(|cx| Root::new(home, window, cx));
+                    window.blur(cx);
+                    root
+                })
+                .expect("open browser manager");
+            #[cfg(target_os = "macos")]
+            {
+                let native_window = window_handle
+                    .update(cx, |_, window, _| native_window_for(window))
+                    .expect("find macOS window");
+                if let Some(native_window) = native_window {
+                    install_native_toolbar(&native_window);
+                }
+            }
         })
         .detach();
     });
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn native_window_for(window: &Window) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
+    use objc2_app_kit::NSView;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return None;
+    };
+    // GPUI's AppKit handle points to its NSView. AppKit owns the view for the
+    // window lifetime, and this callback runs on the UI thread.
+    let view = unsafe { &*handle.ns_view.as_ptr().cast::<NSView>() };
+    view.window()
+}
+
+#[cfg(target_os = "macos")]
+fn install_native_toolbar(native_window: &objc2_app_kit::NSWindow) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSToolbar, NSWindowTitleVisibility, NSWindowToolbarStyle};
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let toolbar = NSToolbar::new(mtm);
+    toolbar.setVisible(true);
+    native_window.setToolbarStyle(NSWindowToolbarStyle::UnifiedCompact);
+    native_window.setToolbar(Some(&toolbar));
+    native_window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+}
+
+#[cfg(target_os = "macos")]
+fn set_native_app_menu_name() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    use objc2_foundation::NSString;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(menu) = NSApplication::sharedApplication(mtm).mainMenu() else {
+        return;
+    };
+    let Some(app_item) = menu.itemAtIndex(0) else {
+        return;
+    };
+    let title = NSString::from_str("Cazer Browser");
+    app_item.setTitle(&title);
+    if let Some(submenu) = app_item.submenu() {
+        submenu.setTitle(&title);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_native_app_icon() {
+    use objc2::{AnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let data = NSData::with_bytes(include_bytes!("../assets/cazer-logo.png"));
+    let Some(icon) = NSImage::initWithData(NSImage::alloc(), &data) else {
+        return;
+    };
+    unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&icon)) };
 }
 
 struct BrowserHome {
@@ -319,7 +555,6 @@ struct BrowserHome {
     browser_progress_shared: Option<Arc<Mutex<Option<DownloadProgress>>>>,
     browser_control: Option<DownloadControl>,
     browser_versions_expanded: bool,
-    browser_delete_pending: Option<String>,
     managed: Vec<ManagedProxy>,
     managed_selected: Option<String>,
     managed_id: Entity<InputState>,
@@ -336,10 +571,10 @@ struct BrowserHome {
     managed_tests: HashMap<String, String>,
     managed_testing: HashSet<String>,
     managed_generation: u64,
-    managed_delete_pending: bool,
     search: Entity<InputState>,
     form_name: Entity<InputState>,
     form_url: Entity<InputState>,
+    form_extra_tabs: Vec<Entity<InputState>>,
     form_proxy_select: Entity<SelectState<Vec<ProfileProxyOption>>>,
     form_country_code: Entity<InputState>,
     form_country: Entity<InputState>,
@@ -350,6 +585,7 @@ struct BrowserHome {
     form_latitude: Entity<InputState>,
     form_longitude: Entity<InputState>,
     tag_input: Entity<InputState>,
+    tag_color_picker: Entity<ColorPickerState>,
     _subscriptions: Vec<Subscription>,
     rows: Vec<ProfileView>,
     page: usize,
@@ -357,15 +593,16 @@ struct BrowserHome {
     loading: bool,
     has_more: bool,
     generation: u64,
-    proxy_filter: Option<ProxyModeFilter>,
+    status_filter: Option<bool>,
+    proxy_filter: Option<ProxyChoice>,
     filter_tags: Vec<String>,
+    filter_tag_options: Vec<String>,
+    filter_tags_generation: u64,
     all_tags: Vec<String>,
+    tag_custom_colors: HashMap<String, String>,
     selected_tag: Option<String>,
-    tag_status: String,
+    tag_form_error: String,
     running: HashSet<String>,
-    selected: HashSet<String>,
-    popup: Option<TagPopup>,
-    popup_position: Point<Pixels>,
     dialog: Dialog,
     form_os: ProfileOs,
     create_mode: CreateMode,
@@ -374,7 +611,8 @@ struct BrowserHome {
     geo_generation: u64,
     geo_error: String,
     busy: bool,
-    status: String,
+    pending_notice: Option<Notification>,
+    status_generation: u64,
     spawned: HashMap<String, Child>,
     launch: Option<LaunchUi>,
 }
@@ -544,7 +782,7 @@ impl BrowserHome {
             }
         };
         self.browser_checking = true;
-        self.browser_status = "正在检查 Camoufox 版本…".into();
+        self.browser_status = "正在检查浏览器版本…".into();
         let manager = self.browser_manager();
         let tokio = self.tokio.clone();
         cx.spawn(async move |this, cx| {
@@ -653,7 +891,7 @@ impl BrowserHome {
                 this.browser_progress_shared = None;
                 this.browser_progress = None;
                 this.browser_status = match result {
-                    Ok(()) => "Camoufox 安装完成".into(),
+                    Ok(()) => "浏览器安装完成".into(),
                     Err(error) => format!("浏览器安装失败：{error}"),
                 };
                 this.refresh_browser_versions();
@@ -821,7 +1059,6 @@ impl BrowserHome {
             .and_then(|id| self.managed.iter().find(|proxy| &proxy.id == id))
             .cloned();
         self.managed_selected = id;
-        self.managed_delete_pending = false;
         let (proxy_id, name, url, username, password, switch_url, wait) =
             if let Some(proxy) = selected {
                 self.managed_policy = proxy.policy;
@@ -887,6 +1124,56 @@ impl BrowserHome {
         cx.notify();
     }
 
+    fn open_managed_editor(
+        &mut self,
+        id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_edit = id.is_some();
+        self.select_managed(id, window, cx);
+        let home = cx.entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let content_home = home.clone();
+            let save_home = home.clone();
+            dialog
+                .title(if is_edit {
+                    "编辑代理"
+                } else {
+                    "添加代理"
+                })
+                .w(px(560.))
+                .content(move |content, _, cx| {
+                    content.child(
+                        content_home
+                            .read(cx)
+                            .render_managed_editor(content_home.clone()),
+                    )
+                })
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("cancel-managed")
+                                .outline()
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("save-managed")
+                                .primary()
+                                .label("保存代理")
+                                .on_click(move |_, window, cx| {
+                                    if save_home.update(cx, |this, cx| this.save_managed(cx)) {
+                                        window.close_dialog(cx);
+                                    }
+                                }),
+                        ),
+                )
+        });
+    }
+
     fn test_managed(&mut self, id: String, cx: &mut Context<Self>) {
         if self.managed_testing.contains(&id) {
             return;
@@ -930,7 +1217,7 @@ impl BrowserHome {
         .detach();
     }
 
-    fn save_managed(&mut self, cx: &mut Context<Self>) {
+    fn save_managed(&mut self, cx: &mut Context<Self>) -> bool {
         let id = self.managed_id.read(cx).value().trim().to_string();
         if self
             .managed_selected
@@ -939,7 +1226,7 @@ impl BrowserHome {
         {
             self.managed_status = "现有代理的 ID 不可修改".into();
             cx.notify();
-            return;
+            return false;
         }
         let switch_url = self.managed_switch_url.read(cx).value().trim().to_string();
         let username = self.managed_username.read(cx).value().to_string();
@@ -976,11 +1263,12 @@ impl BrowserHome {
                 self.managed_generation += 1;
                 self.managed_tests.remove(&proxy.id);
                 self.managed_selected = Some(proxy.id);
-                self.managed_delete_pending = false;
                 match ProxyCatalog::new(self.service.data_dir()).list() {
                     Ok(managed) => {
                         self.managed = managed;
                         self.managed_status = "代理已保存".into();
+                        cx.notify();
+                        return true;
                     }
                     Err(error) => self.managed_status = format!("读取代理失败：{error}"),
                 }
@@ -988,18 +1276,13 @@ impl BrowserHome {
             Err(error) => self.managed_status = format!("保存失败：{error}"),
         }
         cx.notify();
+        false
     }
 
     fn remove_managed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.managed_selected.clone() else {
             return;
         };
-        if !self.managed_delete_pending {
-            self.managed_delete_pending = true;
-            self.managed_status = "再次点击“确认删除”将移除这条代理规则".into();
-            cx.notify();
-            return;
-        }
         match ProxyCatalog::new(self.service.data_dir()).remove(&id) {
             Ok(()) => {
                 self.managed_generation += 1;
@@ -1009,59 +1292,6 @@ impl BrowserHome {
                 self.managed_status = "代理已删除".into();
             }
             Err(error) => self.managed_status = format!("删除失败：{error}"),
-        }
-        cx.notify();
-    }
-
-    fn change_tag(&mut self, remove: bool, cx: &mut Context<Self>) {
-        let Some(old) = self.selected_tag.clone() else {
-            return;
-        };
-        let replacement = self.tag_input.read(cx).value().trim().to_string();
-        if !remove && replacement.is_empty() {
-            self.tag_status = "请输入新标签名称".into();
-            cx.notify();
-            return;
-        }
-        if !remove
-            && self.all_tags.iter().any(|tag| {
-                tag.eq_ignore_ascii_case(&replacement) && !tag.eq_ignore_ascii_case(&old)
-            })
-        {
-            self.tag_status = "新标签名称已存在".into();
-            cx.notify();
-            return;
-        }
-        let catalog = TagCatalog::new(self.service.data_dir());
-        let result = if remove {
-            catalog.remove(&old)
-        } else {
-            catalog.rename(&old, &replacement)
-        };
-        match result {
-            Ok(()) => {
-                self.selected_tag = None;
-                self.tag_status = if remove {
-                    "已从标签目录删除；浏览器原有标签保留".into()
-                } else {
-                    "标签目录已重命名；浏览器原有标签保留".into()
-                };
-                self.load_tags(cx);
-            }
-            Err(error) => self.tag_status = format!("更新失败：{error}"),
-        }
-        cx.notify();
-    }
-
-    fn create_tag(&mut self, cx: &mut Context<Self>) {
-        let name = self.tag_input.read(cx).value().trim().to_string();
-        match TagCatalog::new(self.service.data_dir()).add(&name) {
-            Ok(()) => {
-                self.selected_tag = Some(name);
-                self.tag_status = "标签已加入目录".into();
-                self.load_tags(cx);
-            }
-            Err(error) => self.tag_status = format!("新增失败：{error}"),
         }
         cx.notify();
     }
@@ -1080,7 +1310,7 @@ impl BrowserHome {
             browser_download: browser_download_settings,
             workspace_lock,
         } = initial_settings;
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索名称或 ID"));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索"));
         let form_name = cx.new(|cx| InputState::new(window, cx).placeholder("显示名称"));
         let form_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://www.vinted.fr/"));
@@ -1105,6 +1335,8 @@ impl BrowserHome {
         let form_latitude = cx.new(|cx| InputState::new(window, cx).placeholder("48.86"));
         let form_longitude = cx.new(|cx| InputState::new(window, cx).placeholder("2.35"));
         let tag_input = cx.new(|cx| InputState::new(window, cx).placeholder("输入标签名称"));
+        let tag_color_picker =
+            cx.new(|cx| ColorPickerState::new(window, cx).default_value(rgb(GREEN)));
         let general_host = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("代理服务器")
@@ -1227,7 +1459,6 @@ impl BrowserHome {
             browser_progress_shared: None,
             browser_control: None,
             browser_versions_expanded: true,
-            browser_delete_pending: None,
             managed,
             managed_selected: None,
             managed_id,
@@ -1244,10 +1475,10 @@ impl BrowserHome {
             managed_tests: HashMap::new(),
             managed_testing: HashSet::new(),
             managed_generation: 0,
-            managed_delete_pending: false,
             search,
             form_name,
             form_url,
+            form_extra_tabs: Vec::new(),
             form_proxy_select,
             form_country_code,
             form_country,
@@ -1258,6 +1489,7 @@ impl BrowserHome {
             form_latitude,
             form_longitude,
             tag_input,
+            tag_color_picker,
             _subscriptions: {
                 general_subscriptions.push(subscription);
                 general_subscriptions.push(proxy_subscription);
@@ -1269,3172 +1501,49 @@ impl BrowserHome {
             loading: false,
             has_more: true,
             generation: 0,
+            status_filter: None,
             proxy_filter: None,
             filter_tags: Vec::new(),
+            filter_tag_options: Vec::new(),
+            filter_tags_generation: 0,
             all_tags: Vec::new(),
+            tag_custom_colors: HashMap::new(),
             selected_tag: None,
-            tag_status: String::new(),
+            tag_form_error: String::new(),
             running: HashSet::new(),
-            selected: HashSet::new(),
-            popup: None,
-            popup_position: point(px(0.), px(0.)),
             dialog: Dialog::None,
-            form_os: ProfileOs::Windows,
+            form_os: host_profile_os(),
             create_mode: CreateMode::Smart,
             geo_preview: None,
             geo_loading: false,
             geo_generation: 0,
             geo_error: String::new(),
             busy: false,
-            status: String::new(),
+            pending_notice: None,
+            status_generation: 0,
             spawned: HashMap::new(),
             launch: None,
         };
-        if let Some(id) = this.managed.first().map(|proxy| proxy.id.clone()) {
-            this.select_managed(Some(id), window, cx);
-        }
         this.reload(cx);
         this.load_tags(cx);
         this.refresh_running(cx);
         this.start_polling(cx);
         this
     }
-
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        self.generation += 1;
-        self.rows.clear();
-        self.page = 1;
-        self.total = 0;
-        self.loading = false;
-        self.has_more = true;
-        self.selected.clear();
-        self.request_page(cx);
-    }
-
-    fn request_page(&mut self, cx: &mut Context<Self>) {
-        if self.loading || !self.has_more {
-            return;
-        }
-        self.loading = true;
-        let generation = self.generation;
-        let page = self.page;
-        let service = self.service.clone();
-        let tokio = self.tokio.clone();
-        let query = ProfileQuery {
-            search: Some(self.search.read(cx).value().to_string()),
-            page,
-            page_size: 100,
-        };
-        let filter = ProfileListFilter {
-            proxy_mode: self.proxy_filter,
-            tags: self.filter_tags.clone(),
-        };
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { tokio.block_on(service.list_filtered(query, filter)) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if generation != this.generation {
-                    return;
-                }
-                this.loading = false;
-                match result {
-                    Ok(page_result) => {
-                        this.total = page_result.total;
-                        this.rows.extend(page_result.items);
-                        this.page += 1;
-                        this.has_more = this.rows.len() < this.total;
-                    }
-                    Err(error) => {
-                        this.has_more = false;
-                        this.status = error.to_string();
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn load_tags(&mut self, cx: &mut Context<Self>) {
-        match TagCatalog::new(self.service.data_dir()).list() {
-            Ok(tags) => self.all_tags = tags,
-            Err(error) => self.status = format!("读取标签失败：{error}"),
-        }
-        cx.notify();
-    }
-
-    fn refresh_running(&mut self, cx: &mut Context<Self>) {
-        let service = self.service.clone();
-        let runtime = self.runtime.clone();
-        let tokio = self.tokio.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    tokio.block_on(async {
-                        let ids = service.list_ids().await?;
-                        let mut running = HashSet::new();
-                        for id in ids {
-                            if runtime.is_running(&id).await {
-                                running.insert(id);
-                            }
-                        }
-                        Ok::<_, rust_browser::profiles::ProfileError>(running)
-                    })
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                let launching = this.launch.as_ref().map(|launch| launch.id.as_str());
-                this.spawned.retain(|id, child| {
-                    Some(id.as_str()) == launching || child.try_wait().ok().flatten().is_none()
-                });
-                if let Ok(running) = result
-                    && this.running != running
-                {
-                    this.running = running;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-
-    fn start_polling(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(1500))
-                    .await;
-                if this
-                    .update(cx, |this, cx| this.refresh_running(cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn open_browser(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.browser_busy {
-            self.status = "浏览器版本正在安装，请稍后打开".into();
-            cx.notify();
-            return;
-        }
-        if self.running.contains(&id) || self.spawned.contains_key(&id) || self.launch.is_some() {
-            return;
-        }
-        let Some(profile) = self.rows.iter().find(|profile| profile.id == id) else {
-            return;
-        };
-        let name = profile.name.clone().unwrap_or_else(|| profile.id.clone());
-        let location = format!(
-            "{} · {}",
-            profile.saved_geo.country,
-            profile.saved_geo.city.as_deref().unwrap_or("-")
-        );
-        let result = (|| -> Result<(Child, PathBuf)> {
-            let exe = std::env::current_exe()?;
-            let log_dir = self.paths.logs();
-            fs::create_dir_all(&log_dir)?;
-            let progress_file = self.paths.launch_progress(&id, rand::random::<u64>());
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&progress_file)?;
-            let log = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(self.paths.profile_log(&id))?;
-            let stdout_log = log.try_clone()?;
-            let mut command = ProcessCommand::new(exe);
-            command
-                .arg("--data-dir")
-                .arg(self.service.data_dir())
-                .arg("open")
-                .arg(&id)
-                .arg("--progress-file")
-                .arg(&progress_file)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            // The native manager uses the saved general proxy, including its
-            // credentials, even if the manager inherited a CLI proxy override.
-            command.env_remove("RUST_BROWSER_PROXY");
-            #[cfg(unix)]
-            command.process_group(0);
-            let mut child = match command.spawn() {
-                Ok(child) => child,
-                Err(error) => {
-                    let _ = fs::remove_file(&progress_file);
-                    return Err(error).context("start browser process");
-                }
-            };
-            if let Some(stdout) = child.stdout.take() {
-                mirror_launch_output(stdout, stdout_log, false);
-            }
-            if let Some(stderr) = child.stderr.take() {
-                mirror_launch_output(stderr, log, true);
-            }
-            Ok((child, progress_file))
-        })();
-        match result {
-            Ok((child, progress_file)) => {
-                self.spawned.insert(id.clone(), child);
-                self.launch = Some(LaunchUi {
-                    id: id.clone(),
-                    name,
-                    location,
-                    progress_file,
-                    events_seen: 0,
-                    stage: None,
-                    close_count: None,
-                    switch_ip: false,
-                    error: None,
-                    visible: true,
-                });
-                self.dialog = Dialog::None;
-                self.popup = None;
-                self.status = format!("正在打开 {id}…");
-                self.start_launch_poll(cx);
-            }
-            Err(error) => self.status = error.to_string(),
-        }
-        cx.notify();
-    }
-
-    fn start_launch_poll(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(120))
-                    .await;
-                let Ok(keep_polling) = this.update(cx, |this, cx| this.poll_launch(cx)) else {
-                    break;
-                };
-                if !keep_polling {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn poll_launch(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(launch) = self.launch.as_mut() else {
-            return false;
-        };
-        let events = match read_events(&launch.progress_file) {
-            Ok(events) => events,
-            Err(error) => {
-                launch.error = Some(format!("读取启动进度失败：{error}"));
-                launch.visible = true;
-                cx.notify();
-                return false;
-            }
-        };
-        let mut terminal = false;
-        let mut ready = false;
-        for event in events.iter().skip(launch.events_seen) {
-            terminal = launch.apply(event);
-            ready = matches!(event, LaunchEvent::Ready);
-            if terminal {
-                break;
-            }
-        }
-        launch.events_seen = events.len();
-        let id = launch.id.clone();
-        let path = launch.progress_file.clone();
-        if ready {
-            self.launch = None;
-            self.status = format!("已打开 {id}");
-            let _ = fs::remove_file(path);
-            self.refresh_running(cx);
-            cx.notify();
-            return false;
-        }
-        if terminal {
-            self.status = format!("打开 {id} 失败");
-            let _ = fs::remove_file(path);
-            cx.notify();
-            return false;
-        }
-        if let Some(child) = self.spawned.get_mut(&id)
-            && let Ok(Some(status)) = child.try_wait()
-        {
-            launch.error = Some(format!(
-                "启动进程已退出（{status}），请查看 {}",
-                self.paths.profile_log(&id).display()
-            ));
-            launch.visible = true;
-            self.status = format!("打开 {id} 失败");
-            let _ = fs::remove_file(path);
-            cx.notify();
-            return false;
-        }
-        cx.notify();
-        true
-    }
-
-    fn cancel_launch(&mut self, cx: &mut Context<Self>) {
-        let Some(launch) = self.launch.take() else {
-            return;
-        };
-        if let Some(mut child) = self.spawned.remove(&launch.id) {
-            if child.try_wait().ok().flatten().is_none() {
-                #[cfg(unix)]
-                unsafe {
-                    libc::killpg(child.id() as i32, libc::SIGKILL);
-                }
-                let _ = child.kill();
-            }
-            let _ = child.wait();
-        }
-        let _ = fs::remove_file(launch.progress_file);
-        self.status = if launch.error.is_some() {
-            format!("打开 {} 失败", launch.id)
-        } else {
-            format!("已取消打开 {}", launch.id)
-        };
-        self.refresh_running(cx);
-        cx.notify();
-    }
-
-    fn close_browsers(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
-        if ids.is_empty() {
-            return;
-        }
-        let runtime = self.runtime.clone();
-        let tokio = self.tokio.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    tokio.block_on(async {
-                        let mut errors = Vec::new();
-                        for id in ids {
-                            if let Err(error) = runtime.close(&id).await {
-                                errors.push(format!("{id}: {error}"));
-                            }
-                        }
-                        errors
-                    })
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.status = if result.is_empty() {
-                    "已请求关闭浏览器".into()
-                } else {
-                    result.join("; ")
-                };
-                this.refresh_running(cx);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn show_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dialog = Dialog::Create;
-        if let Ok(managed) = ProxyCatalog::new(self.service.data_dir()).list() {
-            self.managed = managed;
-        }
-        let options = profile_proxy_options(&self.global_proxy, &self.managed, None);
-        self.form_proxy_select.update(cx, |select, cx| {
-            select.set_items(options, window, cx);
-            select.set_selected_value(&ProfileProxySelection::Global, window, cx);
-        });
-        self.form_os = ProfileOs::Windows;
-        self.create_mode = CreateMode::Smart;
-        self.geo_preview = None;
-        self.geo_error.clear();
-        self.geo_generation += 1;
-        for input in [
-            &self.form_name,
-            &self.form_url,
-            &self.form_country_code,
-            &self.form_country,
-            &self.form_region,
-            &self.form_city,
-            &self.form_timezone,
-            &self.form_locale,
-            &self.form_latitude,
-            &self.form_longitude,
-        ] {
-            input.update(cx, |input, cx| input.set_value("", window, cx));
-        }
-        self.detect_geo(cx);
-        cx.notify();
-    }
-
-    fn show_edit(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.geo_generation += 1;
-        if let Ok(managed) = ProxyCatalog::new(self.service.data_dir()).list() {
-            self.managed = managed;
-        }
-        let Some(profile) = self.rows.iter().find(|row| row.id == id) else {
-            return;
-        };
-        self.form_name.update(cx, |input, cx| {
-            input.set_value(profile.name.as_deref().unwrap_or(""), window, cx)
-        });
-        self.form_url.update(cx, |input, cx| {
-            input.set_value(
-                profile.tabs.first().map(String::as_str).unwrap_or(""),
-                window,
-                cx,
-            )
-        });
-        let proxy_choice = profile.proxy.clone();
-        let selected = match &proxy_choice {
-            ProxyChoice::Global => ProfileProxySelection::Global,
-            ProxyChoice::Custom(url) => self
-                .managed
-                .iter()
-                .find(|proxy| &proxy.url == url)
-                .map(|proxy| ProfileProxySelection::Managed(proxy.id.clone()))
-                .unwrap_or_else(|| ProfileProxySelection::ExistingCustom(url.clone())),
-        };
-        let options = profile_proxy_options(&self.global_proxy, &self.managed, Some(&proxy_choice));
-        self.form_proxy_select.update(cx, |select, cx| {
-            select.set_items(options, window, cx);
-            select.set_selected_value(&selected, window, cx);
-        });
-        self.dialog = Dialog::Edit(id);
-        cx.notify();
-    }
-
-    fn selected_form_proxy(&self, cx: &Context<Self>) -> Result<ProxyChoice> {
-        match self.form_proxy_select.read(cx).selected_value() {
-            Some(selection) => profile_proxy_choice(selection, &self.managed),
-            None => Err(anyhow!("请选择代理")),
-        }
-    }
-
-    fn detect_geo(&mut self, cx: &mut Context<Self>) {
-        let proxy = match self.selected_form_proxy(cx) {
-            Ok(ProxyChoice::Global) => Ok(self.global_proxy.clone()),
-            Ok(ProxyChoice::Custom(url)) => {
-                ProxyCatalog::new(self.service.data_dir()).resolve_url(&url)
-            }
-            Err(error) => Err(error),
-        };
-        let proxy = match proxy {
-            Ok(proxy) => proxy,
-            Err(error) => {
-                self.geo_loading = false;
-                self.geo_preview = None;
-                self.geo_error = format!("所选代理不可用：{error}");
-                cx.notify();
-                return;
-            }
-        };
-        self.geo_generation += 1;
-        let generation = self.geo_generation;
-        self.geo_loading = true;
-        self.geo_preview = None;
-        self.geo_error.clear();
-        let tokio = self.tokio.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    tokio.block_on(async {
-                        proxy.check().await?;
-                        ProfileGeo::lookup(&proxy).await
-                    })
-                })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                if generation != this.geo_generation || !matches!(this.dialog, Dialog::Create) {
-                    return;
-                }
-                this.geo_loading = false;
-                match result {
-                    Ok(geo) => {
-                        this.fill_geo_fields(&geo, window, cx);
-                        this.geo_preview = Some(geo);
-                    }
-                    Err(error) => this.geo_error = error.to_string(),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
-    fn fill_geo_fields(&mut self, geo: &ProfileGeo, window: &mut Window, cx: &mut Context<Self>) {
-        for (input, value) in [
-            (&self.form_country_code, geo.country_code.clone()),
-            (&self.form_country, geo.country.clone()),
-            (&self.form_region, geo.region.clone().unwrap_or_default()),
-            (&self.form_city, geo.city.clone().unwrap_or_default()),
-            (&self.form_timezone, geo.timezone.clone()),
-            (&self.form_locale, geo.locale.clone()),
-            (&self.form_latitude, geo.latitude.to_string()),
-            (&self.form_longitude, geo.longitude.to_string()),
-        ] {
-            input.update(cx, |input, cx| input.set_value(&value, window, cx));
-        }
-    }
-
-    fn custom_geo(&self, cx: &Context<Self>) -> Result<ProfileGeoInput> {
-        let value = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
-        Ok(ProfileGeoInput {
-            country_code: value(&self.form_country_code),
-            country: value(&self.form_country),
-            region: Some(value(&self.form_region)),
-            city: Some(value(&self.form_city)),
-            timezone: value(&self.form_timezone),
-            locale: value(&self.form_locale),
-            latitude: value(&self.form_latitude)
-                .parse()
-                .map_err(|_| anyhow!("纬度必须是数字"))?,
-            longitude: value(&self.form_longitude)
-                .parse()
-                .map_err(|_| anyhow!("经度必须是数字"))?,
-        })
-    }
-
-    fn submit_form(&mut self, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
-        let name = self.form_name.read(cx).value().trim().to_string();
-        let url = self.form_url.read(cx).value().trim().to_string();
-        let choice = match self.selected_form_proxy(cx) {
-            Ok(choice) => choice,
-            Err(error) => {
-                self.geo_error = error.to_string();
-                cx.notify();
-                return;
-            }
-        };
-        let tabs = if url.is_empty() {
-            Vec::new()
-        } else {
-            vec![url]
-        };
-        let service = self.service.clone();
-        let tokio = self.tokio.clone();
-        let dialog = self.dialog.clone();
-        let is_create = matches!(dialog, Dialog::Create);
-        let os = self.form_os;
-        let geo = if matches!(dialog, Dialog::Create) && self.create_mode == CreateMode::Custom {
-            match self.custom_geo(cx) {
-                Ok(geo) => Some(geo),
-                Err(error) => {
-                    self.geo_error = error.to_string();
-                    cx.notify();
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        self.geo_error.clear();
-        self.busy = true;
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    tokio.block_on(async {
-                        match dialog {
-                            Dialog::Create => {
-                                service
-                                    .create(CreateProfile::new(
-                                        if name.is_empty() { None } else { Some(name) },
-                                        os,
-                                        tabs,
-                                        choice,
-                                        geo,
-                                    ))
-                                    .await
-                            }
-                            Dialog::Edit(id) => {
-                                service
-                                    .update(
-                                        &id,
-                                        UpdateProfile {
-                                            name: Some(name),
-                                            tabs: Some(tabs),
-                                            proxy: Some(choice),
-                                            tags: None,
-                                        },
-                                    )
-                                    .await
-                            }
-                            _ => unreachable!(),
-                        }
-                    })
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.busy = false;
-                match result {
-                    Ok(profile) => {
-                        this.status = format!("已保存 {}", profile.id);
-                        this.dialog = Dialog::None;
-                        this.reload(cx);
-                        this.load_tags(cx);
-                    }
-                    Err(error) if is_create => this.geo_error = error.to_string(),
-                    Err(error) => this.status = error.to_string(),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn delete_profile(&mut self, id: String, cx: &mut Context<Self>) {
-        let service = self.service.clone();
-        let tokio = self.tokio.clone();
-        self.busy = true;
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { tokio.block_on(service.delete(&id)) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.busy = false;
-                this.dialog = Dialog::None;
-                match result {
-                    Ok(()) => {
-                        this.status = "配置已删除".into();
-                        this.reload(cx);
-                        this.load_tags(cx);
-                    }
-                    Err(error) => this.status = error.to_string(),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn set_profile_tags(&mut self, id: String, tags: Vec<String>, cx: &mut Context<Self>) {
-        let service = self.service.clone();
-        let tokio = self.tokio.clone();
-        let update_id = id.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    tokio.block_on(service.update(
-                        &update_id,
-                        UpdateProfile {
-                            tags: Some(tags),
-                            ..Default::default()
-                        },
-                    ))
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                match result {
-                    Ok(profile) => {
-                        if this.filter_tags.is_empty() {
-                            if let Some(row) = this.rows.iter_mut().find(|row| row.id == id) {
-                                *row = profile;
-                            }
-                        } else {
-                            this.popup = None;
-                            this.reload(cx);
-                        }
-                        this.load_tags(cx);
-                    }
-                    Err(error) => this.status = error.to_string(),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn toggle_tag(&mut self, id: String, tag: String, cx: &mut Context<Self>) {
-        let Some(profile) = self.rows.iter().find(|profile| profile.id == id) else {
-            return;
-        };
-        let mut tags = profile.tags.clone();
-        if let Some(index) = tags
-            .iter()
-            .position(|existing| existing.eq_ignore_ascii_case(&tag))
-        {
-            tags.remove(index);
-        } else {
-            tags.push(tag);
-        }
-        self.set_profile_tags(id, tags, cx);
-    }
-
-    fn add_tag(&mut self, cx: &mut Context<Self>) {
-        let tag = self.tag_input.read(cx).value().trim().to_string();
-        if tag.is_empty() {
-            return;
-        }
-        if let Err(error) = TagCatalog::new(self.service.data_dir()).add(&tag) {
-            self.status = format!("添加标签失败：{error}");
-            cx.notify();
-            return;
-        }
-        self.load_tags(cx);
-        if let Some(TagPopup::Profile(id)) = self.popup.clone() {
-            self.toggle_tag(id, tag, cx);
-        }
-    }
-
-    fn open_tag_popup(
-        &mut self,
-        popup: TagPopup,
-        click: Point<Pixels>,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        let size = window.bounds().size;
-        let x: f32 = click.x.into();
-        let y: f32 = click.y.into();
-        let width: f32 = size.width.into();
-        let height: f32 = size.height.into();
-        self.popup_position = point(
-            px(x.min((width - 258.).max(8.)).max(8.)),
-            px(y.min((height - 428.).max(8.)).max(8.)),
-        );
-        self.popup = Some(popup);
-        cx.notify();
-    }
-
-    fn render_header(&self, _cx: &mut Context<Self>) -> AnyElement {
-        TitleBar::new()
-            .child(
-                h_flex()
-                    .w_full()
-                    .px_4()
-                    .items_center()
-                    .gap_2()
-                    .child(div().size(px(22.)).rounded_full().bg(rgb(GREEN)))
-                    .child(
-                        div()
-                            .font_semibold()
-                            .text_color(rgb(INK))
-                            .child("Cazer Browser"),
-                    )
-                    .child(div().flex_1()),
-            )
-            .into_any_element()
-    }
-
-    fn render_settings_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let active = self.settings_tab.unwrap_or(SettingsTab::General);
-        let mut nav = v_flex()
-            .w(px(218.))
-            .h_full()
-            .p_4()
-            .gap_2()
-            .border_r_1()
-            .border_color(rgb(LINE))
-            .child(
-                Button::new("back-profiles")
-                    .ghost()
-                    .label("← 返回浏览器列表")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.settings_tab = None;
-                        this.reload(cx);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .pt_4()
-                    .pb_3()
-                    .text_xl()
-                    .font_semibold()
-                    .text_color(rgb(INK))
-                    .child("全局设置"),
-            );
-        for (tab, label) in [
-            (SettingsTab::General, "常规"),
-            (SettingsTab::Proxies, "代理管理"),
-            (SettingsTab::Tags, "标签管理"),
-            (SettingsTab::Data, "数据与浏览器"),
-        ] {
-            nav = nav.child(
-                Button::new(format!("settings-{label}"))
-                    .w_full()
-                    .when(active == tab, |button| button.primary())
-                    .when(active != tab, |button| button.ghost())
-                    .label(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings_tab = Some(tab);
-                        if tab == SettingsTab::Tags {
-                            this.load_tags(cx);
-                        }
-                        cx.notify();
-                    })),
-            );
-        }
-        nav.into_any_element()
-    }
-
-    fn render_general_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        v_flex()
-            .w_full()
-            .gap_5()
-            .child(
-                div()
-                    .text_2xl()
-                    .font_semibold()
-                    .text_color(rgb(INK))
-                    .child("常规"),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child("修改有效配置后自动保存"),
-            )
-            .child(
-                v_flex()
-                    .w_full()
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .rounded_md()
-                    .child(
-                        h_flex()
-                            .p_4()
-                            .justify_between()
-                            .border_b_1()
-                            .border_color(rgb(LINE))
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_semibold()
-                                    .text_color(rgb(INK))
-                                    .child("SOCKS5 网络代理"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(GREEN))
-                                    .child(self.general_status.clone()),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .p_5()
-                            .gap_4()
-                            .child(
-                                h_flex()
-                                    .gap_5()
-                                    .child(settings_field("服务器", &self.general_host))
-                                    .child(settings_field("端口", &self.general_port)),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_5()
-                                    .child(settings_field("用户名", &self.general_username))
-                                    .child(settings_field("密码", &self.general_password)),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_5()
-                                    .child(
-                                        h_flex()
-                                            .flex_1()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .w(px(90.))
-                                                    .text_sm()
-                                                    .text_color(rgb(INK))
-                                                    .child("DNS 解析"),
-                                            )
-                                            .child(
-                                                Button::new("general-dns")
-                                                    .outline()
-                                                    .label(if self.general.remote_dns {
-                                                        "通过代理解析"
-                                                    } else {
-                                                        "本地解析"
-                                                    })
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.general.remote_dns =
-                                                            !this.general.remote_dns;
-                                                        this.schedule_general_save(cx);
-                                                    })),
-                                            ),
-                                    )
-                                    .child(settings_field("连接超时（秒）", &self.general_timeout)),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(MUTED))
-                                    .child("用户名和密码留空时使用无认证连接。"),
-                            )
-                            .child(div().h(px(1.)).bg(rgb(LINE)))
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_4()
-                                    .child(
-                                        Button::new("test-general-proxy")
-                                            .outline()
-                                            .label(if self.general_testing {
-                                                "检测中…"
-                                            } else {
-                                                "检测连接"
-                                            })
-                                            .disabled(self.general_testing)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.test_general_proxy(cx)
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(
-                                                if self.general_test.starts_with("连接失败") {
-                                                    RED
-                                                } else {
-                                                    GREEN
-                                                },
-                                            ))
-                                            .child(self.general_test.clone()),
-                                    ),
-                            ),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .w_full()
-                    .p_5()
-                    .gap_4()
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .rounded_md()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_semibold()
-                            .text_color(rgb(INK))
-                            .child("数据目录"),
-                    )
-                    .child(storage_directory_row(
-                        "程序目录（SQLite 与设置）",
-                        self.paths.root().to_path_buf(),
-                        None,
-                        self.storage_busy,
-                        cx,
-                    ))
-                    .child(storage_directory_row(
-                        "浏览器文件工作目录",
-                        self.paths.browser_root().to_path_buf(),
-                        Some(StorageKind::Browser),
-                        self.storage_busy,
-                        cx,
-                    ))
-                    .child(storage_directory_row(
-                        "用户数据工作目录",
-                        self.paths.profiles_root().to_path_buf(),
-                        Some(StorageKind::Profiles),
-                        self.storage_busy,
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child("所选位置分别存放 browser/、browser-versions/ 和 profiles/。"),
-                    )
-                    .when(!self.storage_status.is_empty(), |card| {
-                        card.child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(if self.storage_status.contains("失败") {
-                                    RED
-                                } else {
-                                    GREEN
-                                }))
-                                .child(self.storage_status.clone()),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
-    fn render_managed_settings(&self, narrow: bool, cx: &mut Context<Self>) -> AnyElement {
-        let mut rows = v_flex();
-        for (index, proxy) in self.managed.iter().enumerate() {
-            let id = proxy.id.clone();
-            let selected = self.managed_selected.as_deref() == Some(id.as_str());
-            let policy = match proxy.policy {
-                ProxyPolicy::AllowParallel => "允许并发",
-                ProxyPolicy::RejectNew => "拒绝新开",
-                ProxyPolicy::ClosePrevious => "关闭已有",
-            };
-            let rotation = if proxy.ip_switch.as_ref().is_some_and(|rule| rule.on_start) {
-                "开启"
-            } else {
-                "关闭"
-            };
-            let test = self
-                .managed_tests
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| "未检测".into());
-            let testing = self.managed_testing.contains(&id);
-            let test_id = id.clone();
-            rows = rows.child(
-                h_flex()
-                    .id(SharedString::from(format!("managed-row-{id}")))
-                    .h(px(66.))
-                    .px_3()
-                    .gap_2()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(if selected {
-                        SELECTED
-                    } else if index % 2 == 0 {
-                        0xffffff
-                    } else {
-                        ROW_ALT
-                    }))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_managed(Some(id.clone()), window, cx)
-                    }))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w(px(165.))
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(rgb(INK))
-                                    .child(proxy.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .text_ellipsis()
-                                    .child(proxy.url.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w(px(86.))
-                            .text_xs()
-                            .text_color(rgb(INK))
-                            .child(policy),
-                    )
-                    .child(
-                        div()
-                            .w(px(50.))
-                            .text_xs()
-                            .text_color(rgb(if rotation == "开启" { GREEN } else { MUTED }))
-                            .child(rotation),
-                    )
-                    .child(
-                        div()
-                            .w(px(105.))
-                            .text_xs()
-                            .text_ellipsis()
-                            .text_color(rgb(if test.starts_with("检测失败") {
-                                RED
-                            } else {
-                                MUTED
-                            }))
-                            .child(test),
-                    )
-                    .child(
-                        Button::new(format!("test-managed-{test_id}"))
-                            .outline()
-                            .xsmall()
-                            .label(if testing { "检测中" } else { "检测" })
-                            .disabled(testing)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.test_managed(test_id.clone(), cx)
-                            })),
-                    ),
-            );
-        }
-        let table = v_flex()
-            .flex_1()
-            .min_w(px(535.))
-            .border_1()
-            .border_color(rgb(LINE))
-            .rounded_md()
-            .child(
-                div()
-                    .p_4()
-                    .font_semibold()
-                    .text_color(rgb(INK))
-                    .child("代理列表"),
-            )
-            .child(
-                h_flex()
-                    .h(px(39.))
-                    .px_3()
-                    .gap_2()
-                    .items_center()
-                    .bg(rgb(ROW_ALT))
-                    .border_y_1()
-                    .border_color(rgb(LINE))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(165.))
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("名称 / SOCKS5 地址"),
-                    )
-                    .child(
-                        div()
-                            .w(px(86.))
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("并发策略"),
-                    )
-                    .child(
-                        div()
-                            .w(px(50.))
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("切换 IP"),
-                    )
-                    .child(
-                        div()
-                            .w(px(105.))
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("出口检测"),
-                    )
-                    .child(
-                        div()
-                            .w(px(44.))
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("操作"),
-                    ),
-            )
-            .child(if self.managed.is_empty() {
-                div()
-                    .h(px(120.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child("尚无托管代理，点击右上角添加")
-                    .into_any_element()
-            } else {
-                rows.into_any_element()
-            })
-            .into_any_element();
-
-        let mut policy_buttons = h_flex().gap_2();
-        for (policy, label) in [
-            (ProxyPolicy::AllowParallel, "允许并发"),
-            (ProxyPolicy::RejectNew, "拒绝新开"),
-            (ProxyPolicy::ClosePrevious, "关闭已有"),
-        ] {
-            policy_buttons = policy_buttons.child(
-                Button::new(format!("policy-{label}"))
-                    .when(self.managed_policy == policy, |button| button.primary())
-                    .when(self.managed_policy != policy, |button| button.outline())
-                    .small()
-                    .label(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.managed_policy = policy;
-                        cx.notify();
-                    })),
-            );
-        }
-        let mut method_buttons = h_flex().gap_2();
-        for (method, label) in [(SwitchMethod::Get, "GET"), (SwitchMethod::Post, "POST")] {
-            method_buttons = method_buttons.child(
-                Button::new(format!("switch-method-{label}"))
-                    .when(self.managed_method == method, |button| button.primary())
-                    .when(self.managed_method != method, |button| button.outline())
-                    .small()
-                    .label(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.managed_method = method;
-                        cx.notify();
-                    })),
-            );
-        }
-        let editor = v_flex()
-            .w(px(if narrow { 760. } else { 460. }))
-            .border_1()
-            .border_color(rgb(LINE))
-            .rounded_md()
-            .child(
-                h_flex()
-                    .h(px(53.))
-                    .px_4()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(rgb(LINE))
-                    .child(div().font_semibold().text_color(rgb(INK)).child(
-                        if self.managed_selected.is_some() {
-                            "编辑代理"
-                        } else {
-                            "添加代理"
-                        },
-                    ))
-                    .when(self.managed_selected.is_some(), |row| {
-                        row.child(
-                            Button::new("delete-managed")
-                                .ghost()
-                                .small()
-                                .label(if self.managed_delete_pending {
-                                    "确认删除"
-                                } else {
-                                    "删除"
-                                })
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.remove_managed(window, cx)
-                                })),
-                        )
-                    }),
-            )
-            .child(
-                v_flex()
-                    .p_4()
-                    .gap_4()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(rgb(INK))
-                                    .child("名称"),
-                            )
-                            .child(Input::new(&self.managed_name)),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(rgb(INK))
-                                    .child("SOCKS5 地址"),
-                            )
-                            .child(Input::new(&self.managed_url))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child("格式：socks5://host:port"),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_semibold()
-                                            .text_color(rgb(INK))
-                                            .child("用户名（可选）"),
-                                    )
-                                    .child(Input::new(&self.managed_username)),
-                            )
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_semibold()
-                                            .text_color(rgb(INK))
-                                            .child("密码（可选）"),
-                                    )
-                                    .child(Input::new(&self.managed_password)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("无认证时两项都留空；账号和密码保存在本地 SQLite。"),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(rgb(INK))
-                                    .child("并发策略"),
-                            )
-                            .child(policy_buttons),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(rgb(INK))
-                                    .child("启动时切换 IP"),
-                            )
-                            .child(
-                                Button::new("managed-on-start")
-                                    .when(self.managed_on_start, |button| button.primary())
-                                    .when(!self.managed_on_start, |button| button.outline())
-                                    .small()
-                                    .label(if self.managed_on_start {
-                                        "已开启"
-                                    } else {
-                                        "已关闭"
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.managed_on_start = !this.managed_on_start;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .when(self.managed_on_start, |form| {
-                        form.child(
-                            v_flex()
-                                .gap_1()
-                                .child(div().text_sm().text_color(rgb(INK)).child("切换地址"))
-                                .child(Input::new(&self.managed_switch_url))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(MUTED))
-                                        .child("HTTP 或 HTTPS；在启动浏览器时调用"),
-                                ),
-                        )
-                        .child(
-                            v_flex()
-                                .gap_2()
-                                .child(div().text_sm().text_color(rgb(INK)).child("HTTP 方法"))
-                                .child(method_buttons),
-                        )
-                        .child(
-                            v_flex()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(INK))
-                                        .child("切换后等待（秒）"),
-                                )
-                                .child(Input::new(&self.managed_wait))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(MUTED))
-                                        .child("等待出口 IP 生效；失败最多重试 1 次"),
-                                ),
-                        )
-                    })
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .justify_end()
-                            .child(
-                                Button::new("cancel-managed")
-                                    .outline()
-                                    .label("取消")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.select_managed(
-                                            this.managed_selected.clone(),
-                                            window,
-                                            cx,
-                                        )
-                                    })),
-                            )
-                            .child(
-                                Button::new("save-managed")
-                                    .primary()
-                                    .label("保存代理")
-                                    .on_click(cx.listener(|this, _, _, cx| this.save_managed(cx))),
-                            ),
-                    )
-                    .when(!self.managed_status.is_empty(), |form| {
-                        form.child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(if self.managed_status.contains("失败") {
-                                    RED
-                                } else {
-                                    GREEN
-                                }))
-                                .child(self.managed_status.clone()),
-                        )
-                    }),
-            )
-            .into_any_element();
-        let panels = if narrow {
-            v_flex()
-                .gap_4()
-                .child(table)
-                .child(editor)
-                .into_any_element()
-        } else {
-            h_flex()
-                .items_start()
-                .gap_4()
-                .child(table)
-                .child(editor)
-                .into_any_element()
-        };
-        v_flex()
-            .w_full()
-            .gap_5()
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .font_semibold()
-                            .text_color(rgb(INK))
-                            .child("代理管理"),
-                    )
-                    .child(
-                        Button::new("new-managed-proxy")
-                            .primary()
-                            .icon(IconName::Plus)
-                            .label("添加代理")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.select_managed(None, window, cx)
-                            })),
-                    ),
-            )
-            .child(
-                div().text_sm().text_color(rgb(MUTED)).child(
-                    "为独立代理设置并发策略和启动时的 IP 切换。常规网络代理在“常规”页设置。",
-                ),
-            )
-            .child(panels)
-            .into_any_element()
-    }
-
-    fn render_tag_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut tags = v_flex().gap_1();
-        for tag in &self.all_tags {
-            let name = tag.clone();
-            tags = tags.child(
-                Button::new(format!("settings-tag-{name}"))
-                    .w_full()
-                    .when(self.selected_tag.as_deref() == Some(&name), |button| {
-                        button.primary()
-                    })
-                    .when(self.selected_tag.as_deref() != Some(&name), |button| {
-                        button.ghost()
-                    })
-                    .label(tag.clone())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.selected_tag = Some(name.clone());
-                        this.tag_input
-                            .update(cx, |input, cx| input.set_value(&name, window, cx));
-                        this.tag_status.clear();
-                        cx.notify();
-                    })),
-            );
-        }
-        v_flex()
-            .w_full()
-            .gap_5()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .font_semibold()
-                            .text_color(rgb(INK))
-                            .child("标签管理"),
-                    )
-                    .child(
-                        Button::new("new-catalog-tag")
-                            .primary()
-                            .icon(IconName::Plus)
-                            .label("新增标签")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.selected_tag = None;
-                                this.tag_input
-                                    .update(cx, |input, cx| input.set_value("", window, cx));
-                                this.tag_status.clear();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child("这里管理可选标签目录。修改或删除目录标签不会改变浏览器已保存的标签。"),
-            )
-            .child(
-                h_flex()
-                    .items_start()
-                    .gap_5()
-                    .child(
-                        v_flex()
-                            .w(px(300.))
-                            .p_3()
-                            .gap_1()
-                            .border_1()
-                            .border_color(rgb(LINE))
-                            .rounded_md()
-                            .child(if self.all_tags.is_empty() {
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(MUTED))
-                                    .child("尚无标签")
-                                    .into_any_element()
-                            } else {
-                                tags.into_any_element()
-                            }),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .p_5()
-                            .gap_4()
-                            .border_1()
-                            .border_color(rgb(LINE))
-                            .rounded_md()
-                            .child(div().font_semibold().text_color(rgb(INK)).child(
-                                if self.selected_tag.is_some() {
-                                    "编辑所选标签"
-                                } else {
-                                    "新增标签"
-                                },
-                            ))
-                            .child(settings_field("名称", &self.tag_input))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .when(self.selected_tag.is_none(), |row| {
-                                        row.child(
-                                            Button::new("add-catalog-tag")
-                                                .primary()
-                                                .label("添加标签")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.create_tag(cx)
-                                                })),
-                                        )
-                                    })
-                                    .child(
-                                        Button::new("rename-tag")
-                                            .primary()
-                                            .label("重命名")
-                                            .disabled(self.selected_tag.is_none())
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.change_tag(false, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("remove-tag")
-                                            .outline()
-                                            .label("删除标签")
-                                            .disabled(self.selected_tag.is_none())
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.change_tag(true, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(MUTED))
-                                            .child(self.tag_status.clone()),
-                                    ),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_data_settings(&self, narrow: bool, cx: &mut Context<Self>) -> AnyElement {
-        let manager = self.browser_manager();
-        let current = self.browser_versions.iter().find(|version| version.active);
-        let current_label = current
-            .map(|version| version.version.full_string())
-            .unwrap_or_else(|| "尚未安装".into());
-        let latest_label = self
-            .browser_latest
-            .as_ref()
-            .map(|release| release.version.full_string())
-            .unwrap_or_else(|| "尚未检查".into());
-        let has_update = self.browser_latest.as_ref().is_some_and(|release| {
-            current.is_none_or(|current| current.version != release.version)
-        });
-        let entity = cx.entity();
-        let mut version_rows = v_flex().gap_2();
-        for installed in &self.browser_versions {
-            let version = installed.version.clone();
-            let version_for_delete = version.clone();
-            let key = version.full_string();
-            let active = installed.active;
-            let pending = self.browser_delete_pending.as_deref() == Some(key.as_str());
-            version_rows = version_rows.child(
-                h_flex()
-                    .w_full()
-                    .p_3()
-                    .items_center()
-                    .gap_4()
-                    .rounded_md()
-                    .bg(rgb(ROW_ALT))
-                    .child(
-                        div()
-                            .w(px(160.))
-                            .font_semibold()
-                            .text_color(rgb(INK))
-                            .child(key.clone()),
-                    )
-                    .child(if active { "当前使用" } else { "已安装" })
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(installed.path.display().to_string()),
-                    )
-                    .child(
-                        Button::new(format!("browser-activate-{key}"))
-                            .outline()
-                            .small()
-                            .label("设为当前")
-                            .disabled(active || self.browser_busy || !self.running.is_empty())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.activate_browser_version(version.clone(), cx);
-                            })),
-                    )
-                    .child(
-                        Button::new(format!("browser-delete-{key}"))
-                            .outline()
-                            .small()
-                            .label(if pending { "确认删除" } else { "删除" })
-                            .disabled(active || self.browser_busy)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let key = version_for_delete.full_string();
-                                if this.browser_delete_pending.as_deref() == Some(key.as_str()) {
-                                    this.browser_delete_pending = None;
-                                    this.delete_browser_version(version_for_delete.clone(), cx);
-                                } else {
-                                    this.browser_delete_pending = Some(key);
-                                    this.browser_status = "再次点击“确认删除”移除该历史版本".into();
-                                    cx.notify();
-                                }
-                            })),
-                    ),
-            );
-        }
-        if self.browser_versions.is_empty() {
-            version_rows = version_rows.child(
-                div()
-                    .p_3()
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child("尚无已安装版本"),
-            );
-        }
-        let progress = self.browser_progress.as_ref();
-        let fraction = progress.and_then(|progress| {
-            progress.total.map(|total| {
-                if total == 0 {
-                    0.
-                } else {
-                    (progress.received as f32 / total as f32).clamp(0., 1.)
-                }
-            })
-        });
-        let stage = progress
-            .map(|progress| progress.stage)
-            .unwrap_or(DownloadStage::Download);
-        let progress_title = match stage {
-            DownloadStage::Download => "正在下载",
-            DownloadStage::Verify => "正在校验",
-            DownloadStage::Install => "正在安装",
-        };
-        let progress_text = progress
-            .map(|progress| {
-                let received = progress.received as f64 / 1_048_576.;
-                match progress.total {
-                    Some(total) => format!("{received:.1} / {:.1} MB", total as f64 / 1_048_576.),
-                    None => format!("已下载 {received:.1} MB"),
-                }
-            })
-            .unwrap_or_default();
-        v_flex()
-            .w_full()
-            .gap_4()
-            .child(
-                div()
-                    .text_2xl()
-                    .font_semibold()
-                    .text_color(rgb(INK))
-                    .child("数据与浏览器"),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child("管理 Camoufox 安装与本地数据"),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_4()
-                    .items_stretch()
-                    .when(narrow, |row| row.flex_col())
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .p_5()
-                            .gap_3()
-                            .border_1()
-                            .border_color(rgb(LINE))
-                            .rounded_md()
-                            .child(
-                                div()
-                                    .font_semibold()
-                                    .text_color(rgb(INK))
-                                    .child("Camoufox 浏览器"),
-                            )
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .text_xl()
-                                            .font_semibold()
-                                            .text_color(rgb(INK))
-                                            .child(current_label),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(if current.is_some() {
-                                                GREEN
-                                            } else {
-                                                MUTED
-                                            }))
-                                            .child(if current.is_some() {
-                                                "● 已安装"
-                                            } else {
-                                                "未安装"
-                                            }),
-                                    )
-                                    .child(div().flex_1())
-                                    .child(
-                                        Button::new("browser-check-update")
-                                            .outline()
-                                            .small()
-                                            .label(if self.browser_checking {
-                                                "检查中…"
-                                            } else {
-                                                "检查更新"
-                                            })
-                                            .disabled(self.browser_checking || self.browser_busy)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.check_browser_update(cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("browser-manage-versions")
-                                            .outline()
-                                            .small()
-                                            .label(if self.browser_versions_expanded {
-                                                "收起版本"
-                                            } else {
-                                                "管理版本"
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.browser_versions_expanded =
-                                                    !this.browser_versions_expanded;
-                                                cx.notify();
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                div().text_xs().text_color(rgb(MUTED)).child(format!(
-                                    "安装路径  {}",
-                                    manager.active_path().display()
-                                )),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .p_5()
-                            .gap_3()
-                            .border_1()
-                            .border_color(rgb(LINE))
-                            .rounded_md()
-                            .child(div().font_semibold().text_color(rgb(INK)).child("可用更新"))
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .text_xl()
-                                            .font_semibold()
-                                            .text_color(rgb(INK))
-                                            .child(latest_label),
-                                    )
-                                    .child(div().flex_1())
-                                    .child(
-                                        Button::new("browser-download-install")
-                                            .primary()
-                                            .small()
-                                            .label(if self.browser_busy {
-                                                "安装中…"
-                                            } else {
-                                                "下载并安装"
-                                            })
-                                            .disabled(
-                                                !has_update
-                                                    || self.browser_busy
-                                                    || self.browser_checking,
-                                            )
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.start_browser_download(cx)
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child("来源：Camoufox 官方发布 · 适配当前系统"),
-                            ),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .py_2()
-                    .child(
-                        Checkbox::new("browser-download-global-proxy")
-                            .checked(self.browser_download_settings.use_global_proxy)
-                            .disabled(self.browser_busy || self.browser_checking)
-                            .accessibility_label("使用全局代理下载与更新浏览器")
-                            .on_click(move |checked, _, cx| {
-                                entity.update(cx, |this, cx| {
-                                    let settings = BrowserDownloadSettings {
-                                        use_global_proxy: *checked,
-                                    };
-                                    match settings.save(this.service.data_dir()) {
-                                        Ok(()) => {
-                                            this.browser_download_settings = settings;
-                                            this.browser_latest = None;
-                                            this.browser_status =
-                                                "下载网络设置已自动保存，请重新检查更新".into();
-                                        }
-                                        Err(error) => {
-                                            this.browser_status = format!("保存失败：{error}")
-                                        }
-                                    }
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .text_color(rgb(INK))
-                            .child("使用全局代理下载与更新浏览器"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("勾选后，版本检查、下载与更新使用常规设置中的全局代理。"),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .w_full()
-                    .p_4()
-                    .gap_3()
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .rounded_md()
-                    .child(
-                        div()
-                            .font_semibold()
-                            .text_color(rgb(INK))
-                            .child("已安装版本"),
-                    )
-                    .when(self.browser_versions_expanded, |container| {
-                        container.child(version_rows)
-                    }),
-            )
-            .when(self.browser_busy, |container| {
-                container.child(
-                    v_flex()
-                        .w_full()
-                        .p_4()
-                        .gap_3()
-                        .border_1()
-                        .border_color(rgb(LINE))
-                        .rounded_md()
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_3()
-                                .child(
-                                    div()
-                                        .font_semibold()
-                                        .text_color(rgb(INK))
-                                        .child(progress_title),
-                                )
-                                .child(div().flex_1())
-                                .child(div().text_sm().text_color(rgb(MUTED)).child(progress_text))
-                                .child(
-                                    Button::new("browser-pause-download")
-                                        .outline()
-                                        .small()
-                                        .label(
-                                            if self
-                                                .browser_control
-                                                .as_ref()
-                                                .is_some_and(DownloadControl::is_paused)
-                                            {
-                                                "继续"
-                                            } else {
-                                                "暂停"
-                                            },
-                                        )
-                                        .disabled(stage != DownloadStage::Download)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if let Some(control) = &this.browser_control {
-                                                control.pause(!control.is_paused());
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("browser-cancel-download")
-                                        .outline()
-                                        .small()
-                                        .label("取消")
-                                        .disabled(stage != DownloadStage::Download)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if let Some(control) = &this.browser_control {
-                                                control.cancel();
-                                                this.browser_status = "正在取消下载…".into();
-                                            }
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                        .child(
-                            div().w_full().h(px(9.)).rounded_full().bg(rgb(LINE)).child(
-                                div()
-                                    .w(relative(fraction.unwrap_or(0.)))
-                                    .h_full()
-                                    .rounded_full()
-                                    .bg(rgb(GREEN)),
-                            ),
-                        )
-                        .child(
-                            div().text_xs().text_color(rgb(MUTED)).child(format!(
-                                "下载  →  校验  →  安装     当前：{progress_title}"
-                            )),
-                        ),
-                )
-            })
-            .when(!self.browser_status.is_empty(), |container| {
-                container.child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(if self.browser_status.contains("失败") {
-                            RED
-                        } else {
-                            GREEN
-                        }))
-                        .child(self.browser_status.clone()),
-                )
-            })
-            .child(
-                v_flex()
-                    .p_5()
-                    .gap_3()
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .rounded_md()
-                    .child(div().font_semibold().text_color(rgb(INK)).child("本地数据"))
-                    .child(data_location(
-                        "SQLite 数据库",
-                        self.paths.database(),
-                        true,
-                        cx,
-                    ))
-                    .child(data_location(
-                        "浏览器用户数据",
-                        self.paths.profiles(),
-                        false,
-                        cx,
-                    ))
-                    .child(data_location(
-                        "浏览器安装目录",
-                        manager.active_path(),
-                        false,
-                        cx,
-                    )),
-            )
-            .into_any_element()
-    }
-
-    fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let content = match self.settings_tab.unwrap_or(SettingsTab::General) {
-            SettingsTab::General => self.render_general_settings(cx),
-            SettingsTab::Proxies => {
-                let width: f32 = window.bounds().size.width.into();
-                self.render_managed_settings(width < 1300., cx)
-            }
-            SettingsTab::Tags => self.render_tag_settings(cx),
-            SettingsTab::Data => {
-                let width: f32 = window.bounds().size.width.into();
-                self.render_data_settings(width < 1320., cx)
-            }
-        };
-        h_flex()
-            .flex_1()
-            .min_h_0()
-            .child(self.render_settings_sidebar(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .h_full()
-                    .overflow_y_scrollbar()
-                    .p_8()
-                    .child(content),
-            )
-            .into_any_element()
-    }
-
-    fn render_search_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let proxy_label = match self.proxy_filter {
-            None => "全部代理",
-            Some(ProxyModeFilter::Global) => "跟随全局",
-            Some(ProxyModeFilter::Custom) => "独立配置",
-        };
-        h_flex()
-            .h(px(60.))
-            .px_4()
-            .items_center()
-            .gap_3()
-            .bg(rgb(0xffffff))
-            .child(div().flex_1())
-            .child(div().w(px(270.)).child(
-                Input::new(&self.search).prefix(Icon::new(IconName::Search).text_color(rgb(MUTED))),
-            ))
-            .child(
-                Button::new("proxy-filter")
-                    .outline()
-                    .label(proxy_label)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.proxy_filter = match this.proxy_filter {
-                            None => Some(ProxyModeFilter::Global),
-                            Some(ProxyModeFilter::Global) => Some(ProxyModeFilter::Custom),
-                            Some(ProxyModeFilter::Custom) => None,
-                        };
-                        this.reload(cx);
-                    })),
-            )
-            .child(
-                Button::new("new-profile")
-                    .primary()
-                    .icon(IconName::Plus)
-                    .label("新建浏览器")
-                    .on_click(cx.listener(|this, _, window, cx| this.show_create(window, cx))),
-            )
-            .into_any_element()
-    }
-
-    fn render_runtime_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let selected_running: Vec<String> = self
-            .selected
-            .iter()
-            .filter(|id| self.running.contains(*id))
-            .cloned()
-            .collect();
-        let can_close_selected = !selected_running.is_empty();
-        let can_close_all = !self.running.is_empty();
-        let tag_title = if self.filter_tags.is_empty() {
-            "全部".to_string()
-        } else {
-            format!("已选 {}", self.filter_tags.len())
-        };
-        h_flex()
-            .mx_4()
-            .h(px(50.))
-            .px_3()
-            .items_center()
-            .gap_3()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(0xffffff))
-            .child(div().size(px(8.)).rounded_full().bg(rgb(GREEN)))
-            .child(
-                div()
-                    .text_sm()
-                    .font_semibold()
-                    .text_color(rgb(INK))
-                    .child(format!("正在运行 {} 个", self.running.len())),
-            )
-            .child(div().h(px(20.)).w(px(1.)).bg(rgb(LINE)))
-            .when(
-                self.launch.as_ref().is_some_and(|launch| !launch.visible),
-                |bar| {
-                    bar.child(
-                        Button::new("show-launch-progress")
-                            .outline()
-                            .label("查看启动进度")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(launch) = this.launch.as_mut() {
-                                    launch.visible = true;
-                                    cx.notify();
-                                }
-                            })),
-                    )
-                },
-            )
-            .child(
-                Button::new("close-selected")
-                    .outline()
-                    .label("关闭选中浏览器")
-                    .disabled(!can_close_selected)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_browsers(selected_running.clone(), cx)
-                    })),
-            )
-            .child(
-                Button::new("close-all")
-                    .outline()
-                    .label("关闭全部")
-                    .disabled(!can_close_all)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.dialog = Dialog::CloseAll;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("open-settings")
-                    .outline()
-                    .icon(IconName::Settings)
-                    .label("全局设置")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.settings_tab = Some(SettingsTab::General);
-                        this.popup = None;
-                        cx.notify();
-                    })),
-            )
-            .child(div().flex_1())
-            .child(div().text_sm().text_color(rgb(MUTED)).child("标签"))
-            .child(
-                Button::new("tag-filter")
-                    .outline()
-                    .label(tag_title)
-                    .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                        if matches!(this.popup, Some(TagPopup::Filter)) {
-                            this.popup = None;
-                            cx.notify();
-                        } else {
-                            this.open_tag_popup(TagPopup::Filter, event.position(), window, cx);
-                        }
-                    })),
-            )
-            .into_any_element()
-    }
-
-    fn render_table_header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let all_loaded_selected = !self.rows.is_empty()
-            && self
-                .rows
-                .iter()
-                .all(|profile| self.selected.contains(&profile.id));
-        let entity = cx.entity();
-        h_flex()
-            .mx_4()
-            .mt_2()
-            .h(px(42.))
-            .px_3()
-            .items_center()
-            .border_1()
-            .border_color(rgb(LINE))
-            .rounded_t_md()
-            .bg(rgb(0xf7fafc))
-            .text_xs()
-            .font_semibold()
-            .text_color(rgb(INK))
-            .child(
-                div().w(px(38.)).child(
-                    Checkbox::new("select-loaded")
-                        .checked(all_loaded_selected)
-                        .accessibility_label("选择已加载的浏览器")
-                        .on_click(move |checked, _, cx| {
-                            entity.update(cx, |this, cx| {
-                                if *checked {
-                                    this.selected
-                                        .extend(this.rows.iter().map(|profile| profile.id.clone()));
-                                } else {
-                                    this.selected.clear();
-                                }
-                                cx.notify();
-                            });
-                        }),
-                ),
-            )
-            .child(div().w(px(260.)).child("名称 / ID"))
-            .child(div().w(px(100.)).child("状态"))
-            .child(div().w(px(180.)).child("保存地区"))
-            .child(div().w(px(110.)).child("代理"))
-            .child(div().flex_1().min_w(px(130.)).child("标签"))
-            .child(div().w(px(155.)).child("创建时间"))
-            .child(div().w(px(125.)).child("操作"))
-            .into_any_element()
-    }
-
-    fn render_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let profile = self.rows[index].clone();
-        let id = profile.id.clone();
-        let running = self.running.contains(&id);
-        let selected = self.selected.contains(&id);
-        let entity = cx.entity();
-        let check_id = id.clone();
-        let action_id = id.clone();
-        let edit_id = id.clone();
-        let delete_id = id.clone();
-        let tag_id = id.clone();
-        let location = format!(
-            "{} · {}",
-            profile.saved_geo.country,
-            profile.saved_geo.city.as_deref().unwrap_or("-")
-        );
-        let proxy_label = match &profile.proxy {
-            ProxyChoice::Global => "跟随全局",
-            ProxyChoice::Custom(_) => "独立配置",
-        };
-        let os = match profile.os.as_str() {
-            "macos" => "macOS",
-            "windows" => "Windows",
-            "linux" => "Linux",
-            _ => "未知系统",
-        };
-        let tags = profile
-            .tags
-            .iter()
-            .take(2)
-            .cloned()
-            .map(|tag| {
-                div()
-                    .px_2()
-                    .py_0p5()
-                    .rounded_sm()
-                    .bg(rgb(GREEN_PALE))
-                    .text_xs()
-                    .text_color(rgb(GREEN))
-                    .child(tag)
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-        h_flex()
-            .id(SharedString::from(format!("profile-row-{id}")))
-            .w_full()
-            .h(px(54.))
-            .px_3()
-            .items_center()
-            .text_sm()
-            .border_b_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(if selected {
-                SELECTED
-            } else if index.is_multiple_of(2) {
-                0xffffff
-            } else {
-                ROW_ALT
-            }))
-            .child(
-                div().w(px(38.)).child(
-                    Checkbox::new(SharedString::from(format!("profile-check-{id}")))
-                        .checked(selected)
-                        .accessibility_label(format!("选择 {}", profile.id))
-                        .on_click(move |checked, _, cx| {
-                            entity.update(cx, |this, cx| {
-                                if *checked {
-                                    this.selected.insert(check_id.clone());
-                                } else {
-                                    this.selected.remove(&check_id);
-                                }
-                                cx.notify();
-                            });
-                        }),
-                ),
-            )
-            .child(
-                v_flex()
-                    .w(px(260.))
-                    .gap_0p5()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                div().font_semibold().text_color(rgb(INK)).child(
-                                    profile.name.clone().unwrap_or_else(|| profile.id.clone()),
-                                ),
-                            )
-                            .child(div().text_xs().text_color(rgb(MUTED)).child(os)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(profile.id.clone()),
-                    ),
-            )
-            .child(
-                div()
-                    .w(px(100.))
-                    .text_color(rgb(if running { GREEN } else { MUTED }))
-                    .child(if running {
-                        "● 运行中"
-                    } else {
-                        "● 未运行"
-                    }),
-            )
-            .child(
-                div()
-                    .w(px(180.))
-                    .text_ellipsis()
-                    .text_color(rgb(INK))
-                    .child(location),
-            )
-            .child(
-                div()
-                    .w(px(110.))
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(proxy_label),
-            )
-            .child(
-                h_flex()
-                    .id(SharedString::from(format!("tag-cell-{id}")))
-                    .w_full()
-                    .flex_1()
-                    .min_w(px(130.))
-                    .gap_1()
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        this.open_tag_popup(
-                            TagPopup::Profile(tag_id.clone()),
-                            event.position(),
-                            window,
-                            cx,
-                        );
-                    }))
-                    .children(tags)
-                    .child(div().text_color(rgb(GREEN)).child("＋")),
-            )
-            .child(
-                div()
-                    .w(px(155.))
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(format_date(profile.created_at)),
-            )
-            .child(
-                h_flex()
-                    .w(px(125.))
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        Button::new(SharedString::from(format!("run-{id}")))
-                            .ghost()
-                            .xsmall()
-                            .label(if running { "关闭" } else { "打开" })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if running {
-                                    this.close_browsers(vec![action_id.clone()], cx);
-                                } else {
-                                    this.open_browser(action_id.clone(), cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!("edit-{id}")))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Settings)
-                            .tooltip("编辑配置")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.show_edit(edit_id.clone(), window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new(SharedString::from(format!("delete-{id}")))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Delete)
-                            .tooltip("删除配置")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.dialog = Dialog::Delete(delete_id.clone());
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_tag_popup(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(popup) = self.popup.clone() else {
-            return div().into_any_element();
-        };
-        let selected_tags = match &popup {
-            TagPopup::Filter => self.filter_tags.clone(),
-            TagPopup::Profile(id) => self
-                .rows
-                .iter()
-                .find(|row| &row.id == id)
-                .map(|row| row.tags.clone())
-                .unwrap_or_default(),
-        };
-        let mut available_tags = self.all_tags.clone();
-        if matches!(popup, TagPopup::Profile(_)) {
-            for tag in &selected_tags {
-                if !available_tags
-                    .iter()
-                    .any(|option| option.eq_ignore_ascii_case(tag))
-                {
-                    available_tags.push(tag.clone());
-                }
-            }
-        }
-        let mut options = Vec::new();
-        for tag in available_tags {
-            let tag_for_click = tag.clone();
-            let target = popup.clone();
-            let entity = cx.entity();
-            options.push(
-                h_flex()
-                    .h(px(30.))
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Checkbox::new(SharedString::from(format!("tag-choice-{tag}")))
-                            .checked(selected_tags.contains(&tag))
-                            .accessibility_label(format!("标签 {tag}"))
-                            .on_click(move |checked, _, cx| {
-                                entity.update(cx, |this, cx| match &target {
-                                    TagPopup::Filter => {
-                                        if *checked {
-                                            if !this.filter_tags.contains(&tag_for_click) {
-                                                this.filter_tags.push(tag_for_click.clone());
-                                            }
-                                        } else {
-                                            this.filter_tags
-                                                .retain(|selected| selected != &tag_for_click);
-                                        }
-                                        this.reload(cx);
-                                    }
-                                    TagPopup::Profile(id) => {
-                                        this.toggle_tag(id.clone(), tag_for_click.clone(), cx)
-                                    }
-                                });
-                            }),
-                    )
-                    .child(div().text_sm().text_color(rgb(INK)).child(tag))
-                    .into_any_element(),
-            );
-        }
-        v_flex()
-            .absolute()
-            .top(self.popup_position.y)
-            .left(self.popup_position.x)
-            .w(px(250.))
-            .max_h(px(420.))
-            .overflow_y_scrollbar()
-            .p_3()
-            .gap_2()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(0xffffff))
-            .shadow_lg()
-            .child(
-                h_flex()
-                    .items_center()
-                    .child(div().font_semibold().text_color(rgb(INK)).child(
-                        if matches!(popup, TagPopup::Filter) {
-                            "筛选标签"
-                        } else {
-                            "选择标签"
-                        },
-                    ))
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("close-tags")
-                            .ghost()
-                            .xsmall()
-                            .label("×")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.popup = None;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .children(options)
-            .child(if matches!(popup, TagPopup::Profile(_)) {
-                v_flex()
-                    .pt_2()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(rgb(LINE))
-                    .child(div().text_sm().text_color(rgb(GREEN)).child("＋ 新建标签"))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(div().flex_1().child(Input::new(&self.tag_input).small()))
-                            .child(
-                                Button::new("add-tag")
-                                    .outline()
-                                    .small()
-                                    .label("添加")
-                                    .on_click(cx.listener(|this, _, _, cx| this.add_tag(cx))),
-                            ),
-                    )
-                    .into_any_element()
-            } else {
-                div().into_any_element()
-            })
-            .into_any_element()
-    }
-
-    fn render_create_body(&self, cx: &mut Context<Self>) -> AnyElement {
-        let smart = self.create_mode == CreateMode::Smart;
-        let geo_content: AnyElement = if smart {
-            v_flex()
-                .gap_3()
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_3()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_semibold()
-                                .text_color(rgb(INK))
-                                .child("代理 GEO IP"),
-                        )
-                        .child(
-                            Button::new("detect-geo-smart")
-                                .outline()
-                                .small()
-                                .label(if self.geo_loading {
-                                    "检测中…"
-                                } else {
-                                    "检测代理 GEO IP"
-                                })
-                                .disabled(self.geo_loading)
-                                .on_click(cx.listener(|this, _, _, cx| this.detect_geo(cx))),
-                        )
-                        .child(if self.geo_preview.is_some() {
-                            div()
-                                .text_sm()
-                                .text_color(rgb(GREEN))
-                                .child("● 已获取出口位置")
-                        } else {
-                            div()
-                        }),
-                )
-                .child(if let Some(geo) = &self.geo_preview {
-                    v_flex()
-                        .gap_2()
-                        .p_3()
-                        .rounded_md()
-                        .bg(rgb(GREEN_PALE))
-                        .child(div().font_semibold().text_color(rgb(INK)).child(format!(
-                            "{} · {}  /  {}",
-                            geo.country,
-                            geo.city.as_deref().unwrap_or("-"),
-                            geo.ip
-                        )))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_semibold()
-                                .text_color(rgb(GREEN))
-                                .child("自动生成的配置"),
-                        )
-                        .child(geo_summary_line(
-                            "国家 / 地区",
-                            format!("{} · {}", geo.country_code, geo.country),
-                        ))
-                        .child(geo_summary_line(
-                            "省 / 州",
-                            geo.region.clone().unwrap_or_else(|| "-".into()),
-                        ))
-                        .child(geo_summary_line(
-                            "城市",
-                            geo.city.clone().unwrap_or_else(|| "-".into()),
-                        ))
-                        .child(geo_summary_line("时区", geo.timezone.clone()))
-                        .child(geo_summary_line("语言", geo.locale.clone()))
-                        .child(geo_summary_line(
-                            "经纬度",
-                            format!("{:.4} / {:.4}", geo.latitude, geo.longitude),
-                        ))
-                        .into_any_element()
-                } else {
-                    div()
-                        .p_3()
-                        .rounded_md()
-                        .bg(rgb(ROW_ALT))
-                        .text_sm()
-                        .text_color(rgb(MUTED))
-                        .child(if self.geo_loading {
-                            "正在通过代理获取出口位置…"
-                        } else {
-                            "检测代理后，这里会显示自动填充的地理配置。"
-                        })
-                        .into_any_element()
-                })
-                .into_any_element()
-        } else {
-            v_flex()
-                .gap_3()
-                .child(
-                    h_flex()
-                        .items_center()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_semibold()
-                                .text_color(rgb(INK))
-                                .child("地理位置 (GEO)"),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            Button::new("detect-geo-custom")
-                                .outline()
-                                .small()
-                                .label(if self.geo_loading {
-                                    "填充中…"
-                                } else {
-                                    "从 GEO IP 填充"
-                                })
-                                .disabled(self.geo_loading)
-                                .on_click(cx.listener(|this, _, _, cx| this.detect_geo(cx))),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .gap_3()
-                        .child(geo_field("国家代码", &self.form_country_code))
-                        .child(geo_field("国家 / 地区", &self.form_country)),
-                )
-                .child(
-                    h_flex()
-                        .gap_3()
-                        .child(geo_field("省 / 州", &self.form_region))
-                        .child(geo_field("城市", &self.form_city)),
-                )
-                .child(
-                    h_flex()
-                        .gap_3()
-                        .child(geo_field("时区", &self.form_timezone))
-                        .child(geo_field("语言", &self.form_locale)),
-                )
-                .child(
-                    h_flex()
-                        .gap_3()
-                        .child(geo_field("纬度", &self.form_latitude))
-                        .child(geo_field("经度", &self.form_longitude)),
-                )
-                .into_any_element()
-        };
-        v_flex()
-            .gap_3()
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_1()
-                    .p_1()
-                    .rounded_md()
-                    .bg(rgb(ROW_ALT))
-                    .child(
-                        Button::new("create-mode-smart")
-                            .flex_1()
-                            .when(smart, |button| button.primary())
-                            .when(!smart, |button| button.ghost())
-                            .label("智能模式")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.create_mode = CreateMode::Smart;
-                                if let Some(geo) = this.geo_preview.clone() {
-                                    this.fill_geo_fields(&geo, window, cx);
-                                } else if !this.geo_loading {
-                                    this.detect_geo(cx);
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("create-mode-custom")
-                            .flex_1()
-                            .when(!smart, |button| button.primary())
-                            .when(smart, |button| button.ghost())
-                            .label("自定义模式")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.create_mode = CreateMode::Custom;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(form_field("名称", &self.form_name, cx))
-            .child(form_field("启动页面", &self.form_url, cx))
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(100.))
-                            .text_sm()
-                            .text_color(rgb(INK))
-                            .child("代理"),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(Select::new(&self.form_proxy_select).w_full()),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(100.))
-                            .text_sm()
-                            .text_color(rgb(INK))
-                            .child("操作系统"),
-                    )
-                    .child(
-                        Button::new("create-os")
-                            .outline()
-                            .small()
-                            .label(match self.form_os {
-                                ProfileOs::Windows => "Windows",
-                                ProfileOs::Macos => "macOS",
-                                ProfileOs::Linux => "Linux",
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.form_os = match this.form_os {
-                                    ProfileOs::Windows => ProfileOs::Macos,
-                                    ProfileOs::Macos => ProfileOs::Linux,
-                                    ProfileOs::Linux => ProfileOs::Windows,
-                                };
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(div().h(px(1.)).w_full().bg(rgb(LINE)))
-            .child(geo_content)
-            .child(if self.geo_error.is_empty() {
-                div().into_any_element()
-            } else {
-                div()
-                    .text_sm()
-                    .text_color(rgb(RED))
-                    .child(self.geo_error.clone())
-                    .into_any_element()
-            })
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("创建时固定地理身份；国家名称与代码、时区须与代理出口一致。"),
-            )
-            .into_any_element()
-    }
-
-    fn render_dialog(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let dialog = self.dialog.clone();
-        if matches!(dialog, Dialog::None) {
-            return div().into_any_element();
-        }
-        let title = match &dialog {
-            Dialog::Create => "新建浏览器",
-            Dialog::Edit(_) => "编辑浏览器",
-            Dialog::Delete(_) => "删除浏览器",
-            Dialog::CloseAll => "关闭全部浏览器",
-            Dialog::None => unreachable!(),
-        };
-        let body: AnyElement = match dialog.clone() {
-            Dialog::Create => self.render_create_body(cx),
-            Dialog::Edit(id) => v_flex()
-                .gap_3()
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().w(px(100.)).text_sm().text_color(rgb(INK)).child("ID"))
-                        .child(div().text_sm().text_color(rgb(MUTED)).child(id)),
-                )
-                .child(form_field("名称", &self.form_name, cx))
-                .child(form_field("启动页面", &self.form_url, cx))
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().w(px(100.)).text_sm().child("代理"))
-                        .child(
-                            div()
-                                .flex_1()
-                                .child(Select::new(&self.form_proxy_select).w_full()),
-                        ),
-                )
-                .child(div().text_xs().text_color(rgb(MUTED)).child(
-                    "修改代理后，启动时仍会校验出口国家和时区；已固定的浏览器指纹保持不变。",
-                ))
-                .into_any_element(),
-            Dialog::Delete(id) => div()
-                .text_color(rgb(INK))
-                .child(format!("永久删除 {id} 及其浏览器数据？"))
-                .into_any_element(),
-            Dialog::CloseAll => div()
-                .text_color(rgb(INK))
-                .child(format!("关闭当前运行的 {} 个浏览器？", self.running.len()))
-                .into_any_element(),
-            Dialog::None => unreachable!(),
-        };
-        let confirm = match dialog {
-            Dialog::Create | Dialog::Edit(_) => "保存",
-            Dialog::Delete(_) => "删除",
-            Dialog::CloseAll => "关闭全部",
-            Dialog::None => unreachable!(),
-        };
-        let confirm_dialog = dialog.clone();
-        let confirm_disabled = self.busy
-            || (matches!(dialog, Dialog::Create)
-                && self.create_mode == CreateMode::Smart
-                && (self.geo_loading || self.geo_preview.is_none()));
-        let card = v_flex()
-            .w(px(if matches!(dialog, Dialog::Create) {
-                640.
-            } else {
-                520.
-            }))
-            .max_h(window.bounds().size.height - px(48.))
-            .p_5()
-            .gap_4()
-            .rounded_lg()
-            .bg(rgb(0xffffff))
-            .shadow_lg()
-            .child(
-                h_flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_semibold()
-                            .text_color(rgb(INK))
-                            .child(title),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("dialog-close")
-                            .ghost()
-                            .label("×")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.dialog = Dialog::None;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(body)
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        Button::new("dialog-cancel")
-                            .outline()
-                            .label("取消")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.dialog = Dialog::None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("dialog-confirm")
-                            .primary()
-                            .label(confirm)
-                            .disabled(confirm_disabled)
-                            .on_click(cx.listener(move |this, _, _, cx| match &confirm_dialog {
-                                Dialog::Create | Dialog::Edit(_) => this.submit_form(cx),
-                                Dialog::Delete(id) => this.delete_profile(id.clone(), cx),
-                                Dialog::CloseAll => {
-                                    this.dialog = Dialog::None;
-                                    this.close_browsers(this.running.iter().cloned().collect(), cx);
-                                }
-                                Dialog::None => {}
-                            })),
-                    ),
-            )
-            .overflow_y_scrollbar();
-        div()
-            .absolute()
-            .inset_0()
-            .bg(hsla(0., 0., 0., 0.38))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(card)
-            .into_any_element()
-    }
-
-    fn render_launch_dialog(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let Some(launch) = self.launch.as_ref().filter(|launch| launch.visible) else {
-            return div().into_any_element();
-        };
-        let steps = launch.steps();
-        let active = launch
-            .stage
-            .and_then(|stage| steps.iter().position(|item| *item == stage))
-            .unwrap_or(0);
-        let failed = launch.error.is_some();
-        let fill = ((active as f32 + 0.5) / steps.len() as f32).clamp(0.08, 0.94);
-        let id = launch.id.clone();
-        let items = steps
-            .iter()
-            .enumerate()
-            .map(|(index, stage)| {
-                let completed = index < active;
-                let current = index == active;
-                let color = if failed && current {
-                    RED
-                } else if completed || current {
-                    GREEN
-                } else {
-                    MUTED
-                };
-                let marker = div()
-                    .size(px(25.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .border_2()
-                    .border_color(rgb(color))
-                    .bg(rgb(if completed { GREEN } else { 0xffffff }))
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(rgb(0xffffff))
-                    .child(if completed {
-                        "✓"
-                    } else if failed && current {
-                        "×"
-                    } else {
-                        ""
-                    });
-                let detail = if current && !failed {
-                    match stage {
-                        LaunchStage::ClosePeers => launch
-                            .close_count
-                            .map(|count| format!("正在关闭 {count} 个使用此代理的浏览器…")),
-                        LaunchStage::VerifyGeo => {
-                            Some("正在确认代理出口与保存的地区一致".to_string())
-                        }
-                        LaunchStage::SwitchIp => Some("正在切换并验证新的出口 IP".to_string()),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                h_flex()
-                    .min_h(px(if detail.is_some() { 49. } else { 38. }))
-                    .items_start()
-                    .gap_3()
-                    .child(marker)
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(rgb(if current || completed { INK } else { MUTED }))
-                                    .child(launch_stage_label(*stage)),
-                            )
-                            .when_some(detail, |body, detail| {
-                                body.child(div().text_xs().text_color(rgb(MUTED)).child(detail))
-                            }),
-                    )
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-        let card = v_flex()
-            .w(px(570.))
-            .max_h(window.bounds().size.height - px(48.))
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(0xffffff))
-            .shadow_lg()
-            .child(
-                v_flex()
-                    .p_6()
-                    .gap_4()
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .size(px(38.))
-                                    .rounded_full()
-                                    .border_4()
-                                    .border_color(rgb(GREEN))
-                                    .bg(rgb(GREEN_PALE)),
-                            )
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .child(
-                                        div().text_lg().font_semibold().text_color(rgb(INK)).child(
-                                            if failed {
-                                                "打开浏览器失败"
-                                            } else {
-                                                "正在打开浏览器"
-                                            },
-                                        ),
-                                    )
-                                    .child(div().text_sm().text_color(rgb(MUTED)).child(format!(
-                                        "{} · {} · {}",
-                                        launch.name, launch.id, launch.location
-                                    ))),
-                            ),
-                    )
-                    .child(v_flex().gap_2().children(items))
-                    .child(
-                        div().w_full().h(px(7.)).rounded_full().bg(rgb(LINE)).child(
-                            div()
-                                .w(relative(fill))
-                                .h_full()
-                                .rounded_full()
-                                .bg(rgb(if failed { RED } else { GREEN })),
-                        ),
-                    )
-                    .child(if let Some(error) = &launch.error {
-                        div()
-                            .p_3()
-                            .rounded_md()
-                            .bg(rgb(0xfff1f0))
-                            .text_sm()
-                            .text_color(rgb(RED))
-                            .child(error.clone())
-                            .into_any_element()
-                    } else {
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("请稍候，首次启动可能需要更长时间")
-                            .into_any_element()
-                    }),
-            )
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_3()
-                    .p_4()
-                    .border_t_1()
-                    .border_color(rgb(LINE))
-                    .child(
-                        Button::new("launch-cancel")
-                            .outline()
-                            .label(if failed { "关闭" } else { "取消启动" })
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel_launch(cx))),
-                    )
-                    .child(if failed {
-                        Button::new("launch-retry")
-                            .primary()
-                            .label("重试")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.cancel_launch(cx);
-                                this.open_browser(id.clone(), cx);
-                            }))
-                            .into_any_element()
-                    } else {
-                        Button::new("launch-background")
-                            .ghost()
-                            .label("在后台继续")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(launch) = this.launch.as_mut() {
-                                    launch.visible = false;
-                                    cx.notify();
-                                }
-                            }))
-                            .into_any_element()
-                    }),
-            )
-            .overflow_y_scrollbar();
-        div()
-            .absolute()
-            .inset_0()
-            .bg(hsla(0., 0., 0., 0.38))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(card)
-            .into_any_element()
-    }
 }
 
 impl Render for BrowserHome {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_pending_notice(window, cx);
         if self.settings_tab.is_some() {
             return div()
                 .size_full()
                 .relative()
-                .bg(rgb(0xffffff))
+                .bg(rgb(0xf7fafc))
                 .child(
-                    v_flex()
+                    h_flex()
                         .size_full()
-                        .child(self.render_header(cx))
+                        .child(self.render_navigation(cx))
                         .child(self.render_settings(window, cx)),
                 )
                 .when(self.storage_busy, |page| {
@@ -4456,11 +1565,22 @@ impl Render for BrowserHome {
                             ),
                     )
                 })
+                .children(Root::render_dialog_layer(window, cx))
+                .children(Root::render_notification_layer(window, cx))
                 .into_any_element();
         }
-        let rows = if self.rows.is_empty() {
+        let visible_rows = self.visible_row_indices();
+        if visible_rows.is_empty() && self.status_filter.is_some() && self.has_more && !self.loading
+        {
+            self.request_page(cx);
+        }
+        let content_width = (f32::from(window.bounds().size.width) - 204. - 32.).max(0.);
+        let columns = ((content_width + 12.) / 304.).floor().max(1.) as usize;
+        let cards = if visible_rows.is_empty() {
             div()
-                .flex_1()
+                .absolute()
+                .inset_0()
+                .pt(px(72.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -4472,57 +1592,61 @@ impl Render for BrowserHome {
                 })
                 .into_any_element()
         } else {
+            let visible_count = visible_rows.len();
+            let row_count = visible_count.div_ceil(columns);
             uniform_list(
-                "profile-list",
-                self.rows.len(),
-                cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                    if range.end >= this.rows.len().saturating_sub(20) {
+                SharedString::from(format!("profile-cards-{columns}")),
+                row_count,
+                cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
+                    if range.end >= row_count.saturating_sub(3) {
                         this.request_page(cx);
                     }
                     range
-                        .map(|index| this.render_row(index, cx))
+                        .map(|row| {
+                            let start = row * columns;
+                            let end = (start + columns).min(visible_count);
+                            h_flex()
+                                .w_full()
+                                .h(px(162.))
+                                .gap_3()
+                                .children((start..end).map(|index| {
+                                    this.render_profile_card(visible_rows[index], window, cx)
+                                }))
+                                .children((end..start + columns).map(|_| div().flex_1()))
+                                .into_any_element()
+                        })
                         .collect::<Vec<_>>()
                 }),
             )
-            .mx_4()
-            .flex_1()
-            .min_h_0()
-            .border_x_1()
-            .border_b_1()
-            .border_color(rgb(LINE))
+            .absolute()
+            .inset_0()
+            .p_4()
+            .pt(px(72.))
             .into_any_element()
         };
         div()
             .size_full()
             .relative()
-            .bg(rgb(0xffffff))
+            .bg(rgb(0xf7fafc))
             .child(
-                v_flex()
+                h_flex()
                     .size_full()
-                    .child(self.render_header(cx))
-                    .child(self.render_search_bar(cx))
-                    .child(self.render_runtime_bar(cx))
-                    .child(self.render_table_header(cx))
-                    .child(rows),
+                    .child(self.render_navigation(cx))
+                    .child(
+                        div().flex_1().h_full().relative().child(cards).child(
+                            div()
+                                .absolute()
+                                .top(px(16.))
+                                .left(px(16.))
+                                .right(px(16.))
+                                .child(self.render_search_bar(cx)),
+                        ),
+                    ),
             )
-            .child(self.render_tag_popup(cx))
             .child(self.render_dialog(window, cx))
             .child(self.render_launch_dialog(window, cx))
-            .child(if self.status.is_empty() {
-                div().into_any_element()
-            } else {
-                div()
-                    .absolute()
-                    .bottom(px(16.))
-                    .right(px(22.))
-                    .p_2()
-                    .rounded_md()
-                    .bg(rgb(INK))
-                    .text_xs()
-                    .text_color(rgb(0xffffff))
-                    .child(self.status.clone())
-                    .into_any_element()
-            })
+            .children(Root::render_dialog_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
             .into_any_element()
     }
 }
@@ -4540,7 +1664,7 @@ fn settings_field(label: &'static str, input: &Entity<InputState>) -> AnyElement
 fn storage_directory_row(
     label: &'static str,
     root: PathBuf,
-    kind: Option<StorageKind>,
+    kind: StorageKind,
     busy: bool,
     cx: &mut Context<BrowserHome>,
 ) -> AnyElement {
@@ -4562,17 +1686,14 @@ fn storage_directory_row(
                 .text_color(rgb(MUTED))
                 .child(root.display().to_string()),
         )
-        .when_some(kind, |row, kind| {
-            row.child(
-                Button::new(format!("change-directory-{}", kind.label()))
-                    .outline()
-                    .label("选择目录")
-                    .disabled(busy)
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.choose_storage_root(kind, cx)),
-                    ),
-            )
-        })
+        .child(
+            Button::new(format!("change-directory-{}", kind.label()))
+                .outline()
+                .small()
+                .label("选择目录")
+                .disabled(busy)
+                .on_click(cx.listener(move |this, _, _, cx| this.choose_storage_root(kind, cx))),
+        )
         .into_any_element()
 }
 
@@ -4648,12 +1769,24 @@ fn form_field(
 
 fn launch_stage_label(stage: LaunchStage) -> &'static str {
     match stage {
-        LaunchStage::CheckProxy => "检查代理连接",
-        LaunchStage::ClosePeers => "关闭占用该代理的浏览器",
-        LaunchStage::SwitchIp => "切换代理出口 IP",
-        LaunchStage::GeoIp => "获取出口 IP 与地区",
-        LaunchStage::VerifyGeo => "校验 Profile 地区",
-        LaunchStage::StartBrowser => "启动 Camoufox",
+        LaunchStage::CheckProxy => "连接网络",
+        LaunchStage::ClosePeers => "准备网络",
+        LaunchStage::SwitchIp => "切换网络",
+        LaunchStage::GeoIp => "获取当前位置",
+        LaunchStage::VerifyGeo => "确认地区",
+        LaunchStage::StartBrowser => "打开浏览器",
+    }
+}
+
+fn launch_error_message(error: &str) -> &'static str {
+    if error.contains("location mismatch") {
+        "当前网络地区与浏览器保存的地区不一致，请更换网络后重试。"
+    } else if error.contains("proxy") || error.contains("代理") {
+        "网络连接失败，请检查代理设置后重试。"
+    } else if error.contains("not installed") || error.contains("未安装") {
+        "浏览器组件尚未安装，请先在全局设置中安装。"
+    } else {
+        "浏览器未能打开，请检查网络和浏览器设置后重试。"
     }
 }
 
@@ -4685,7 +1818,10 @@ fn format_date(timestamp: u64) -> String {
 mod launch_tests {
     use std::path::PathBuf;
 
-    use super::{LaunchUi, ProfileProxySelection, profile_proxy_choice, profile_proxy_options};
+    use super::{
+        LaunchUi, ProfileProxySelection, profile_proxy_choice, profile_proxy_options,
+        proxy_display_name,
+    };
     use rust_browser::launch_progress::{LaunchEvent, LaunchStage};
     use rust_browser::profiles::ProxyChoice;
     use rust_browser::proxy::ProxySettings;
@@ -4703,14 +1839,25 @@ mod launch_tests {
             ip_switch: None,
         }];
         let options = profile_proxy_options(&global, &managed, None);
-        assert_eq!(options.len(), 2);
-        assert!(matches!(options[0].value, ProfileProxySelection::Global));
+        assert_eq!(options.len(), 3);
+        assert_eq!(proxy_display_name(&ProxyChoice::Global, &managed), "全局");
+        assert_eq!(proxy_display_name(&ProxyChoice::Direct, &managed), "直连");
         assert_eq!(
-            options[1].value,
+            proxy_display_name(&ProxyChoice::Custom(managed[0].url.clone()), &managed),
+            "法国代理"
+        );
+        assert!(matches!(options[0].value, ProfileProxySelection::Global));
+        assert_eq!(options[1].label.as_ref(), "直连（不使用代理）");
+        assert!(matches!(
+            profile_proxy_choice(&options[1].value, &managed).unwrap(),
+            ProxyChoice::Direct
+        ));
+        assert_eq!(
+            options[2].value,
             ProfileProxySelection::Managed("fr".into())
         );
         assert!(matches!(
-            profile_proxy_choice(&options[1].value, &managed).unwrap(),
+            profile_proxy_choice(&options[2].value, &managed).unwrap(),
             ProxyChoice::Custom(url) if url == "socks5://proxy.example:1080"
         ));
         assert_eq!(
@@ -4720,16 +1867,16 @@ mod launch_tests {
                 Some(&ProxyChoice::Custom("socks5://proxy.example:1080".into()))
             )
             .len(),
-            2
+            3
         );
         let existing = profile_proxy_options(
             &global,
             &managed,
             Some(&ProxyChoice::Custom("socks5://other.example:1080".into())),
         );
-        assert_eq!(existing.len(), 3);
+        assert_eq!(existing.len(), 4);
         assert!(matches!(
-            profile_proxy_choice(&existing[2].value, &managed).unwrap(),
+            profile_proxy_choice(&existing[3].value, &managed).unwrap(),
             ProxyChoice::Custom(url) if url == "socks5://other.example:1080"
         ));
     }

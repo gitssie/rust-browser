@@ -61,9 +61,13 @@ fn initialize(root: &Path) -> Result<()> {
             value TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS tags (
-            name TEXT PRIMARY KEY COLLATE NOCASE
+            name TEXT PRIMARY KEY COLLATE NOCASE,
+            color TEXT
         );",
     )?;
+    if conn.prepare("SELECT color FROM tags LIMIT 0").is_err() {
+        conn.execute("ALTER TABLE tags ADD COLUMN color TEXT", [])?;
+    }
     Ok(())
 }
 
