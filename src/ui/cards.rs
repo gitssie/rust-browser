@@ -173,13 +173,23 @@ impl BrowserHome {
                                     .child(if os == "Windows" {
                                         svg()
                                             .data(WINDOWS_ICON)
-                                            .size(px(15.))
+                                            .size(px(16.))
                                             .text_color(rgb(0x087cf2))
                                             .into_any_element()
                                     } else if os == "macOS" {
-                                        div().text_size(px(16.)).child("").into_any_element()
+                                        svg()
+                                            .data(APPLE_ICON)
+                                            .size(px(16.))
+                                            .text_color(rgb(0x63769a))
+                                            .into_any_element()
+                                    } else if os == "Linux" {
+                                        svg()
+                                            .data(LINUX_ICON)
+                                            .size(px(16.))
+                                            .text_color(rgb(0x63769a))
+                                            .into_any_element()
                                     } else {
-                                        div().text_size(px(13.)).child("◆").into_any_element()
+                                        div().text_size(px(13.)).child("?").into_any_element()
                                     })
                                     .child(div().h(px(13.)).w(px(1.)).bg(rgb(LINE)))
                                     .child(div().max_w(px(85.)).text_ellipsis().child(proxy)),

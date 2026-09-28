@@ -562,6 +562,11 @@ fn launch_options(
                 .unwrap_or_default()
                 .to_string()
         });
+    let zh_cn_font = persona
+        .metadata
+        .get("zh_cn_font")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let mut options = LaunchOptions {
         os: vec![persona_os(&persona)?],
         persona: Some(persona),
@@ -587,6 +592,14 @@ fn launch_options(
         ff_version: Some(ff_version),
         ..Default::default()
     };
+    if let Some(font) = zh_cn_font {
+        options.fonts.push(font.clone());
+        for generic in ["serif", "sans-serif", "monospace"] {
+            options
+                .firefox_user_prefs
+                .insert(format!("font.name-list.{generic}.zh-CN"), json!(font));
+        }
+    }
     // Apply proxy prefs before Firefox's startup networking.
     if let Some(proxy) = proxy {
         proxy.apply_firefox_prefs(&mut options.firefox_user_prefs);
@@ -1260,7 +1273,49 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camoufox_core::fingerprint::FingerprintRequest;
+    use camoufox_pkgman::version::CamoufoxVersion;
     use rust_browser::launch_progress::read_events;
+
+    #[test]
+    fn first_launch_uses_font_saved_at_profile_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let mut persona = PersonaRecord::generate(
+            "chinese-profile",
+            &FingerprintRequest {
+                operating_systems: Some(vec![SupportedOs::Linux]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        persona.metadata.insert("os".into(), json!("linux"));
+        persona
+            .metadata
+            .insert("zh_cn_font".into(), json!("PingFang SC"));
+        let installation = ActiveInstallation {
+            root: paths.browser(),
+            version: CamoufoxVersion::new("beta.31", Some("152.0.4".into())),
+            executable_path: paths.browser().join("camoufox"),
+        };
+        let mut old_persona = persona.clone();
+        old_persona.metadata.remove("zh_cn_font");
+        let options =
+            launch_options(&paths, "chinese-profile", persona, None, &installation).unwrap();
+        assert_eq!(options.fonts, ["PingFang SC"]);
+        assert_eq!(
+            options.firefox_user_prefs["font.name-list.sans-serif.zh-CN"],
+            json!("PingFang SC")
+        );
+        let old_options =
+            launch_options(&paths, "old-profile", old_persona, None, &installation).unwrap();
+        assert!(old_options.fonts.is_empty());
+        assert!(
+            !old_options
+                .firefox_user_prefs
+                .contains_key("font.name-list.sans-serif.zh-CN")
+        );
+    }
 
     #[test]
     fn direct_launch_clears_saved_proxy_preferences() {
