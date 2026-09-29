@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -16,6 +17,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::geo::ProfileGeo;
+use crate::notes::NoteRepository;
 use crate::paths::AppPaths;
 use crate::proxy::ProxySettings;
 use crate::proxy_management::ProxyCatalog;
@@ -276,6 +278,18 @@ pub struct ProfilePage {
     pub total_pages: usize,
 }
 
+fn note_snippet(markdown: &str, query: &str) -> String {
+    markdown
+        .lines()
+        .find(|line| line.to_lowercase().contains(query))
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches(['#', '-', '*', ' '])
+        .chars()
+        .take(72)
+        .collect()
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ProfileView {
     pub id: String,
@@ -290,6 +304,8 @@ pub struct ProfileView {
     pub saved_geo: ProfileGeo,
     pub browser_data_dir: PathBuf,
     pub user_agent: String,
+    pub note_present: bool,
+    pub note_match: Option<String>,
 }
 
 /// All profile metadata is stored in camoufox-store; browser state stays in its own directory.
@@ -410,6 +426,20 @@ impl ProfileService {
     }
 
     fn view(&self, record: &PersonaRecord) -> ProfileResult<ProfileView> {
+        let note_present = !NoteRepository::new(self.paths.root())
+            .get(&record.id)
+            .map_err(storage)?
+            .markdown
+            .is_empty();
+        self.view_with_note(record, note_present, None)
+    }
+
+    fn view_with_note(
+        &self,
+        record: &PersonaRecord,
+        note_present: bool,
+        note_match: Option<String>,
+    ) -> ProfileResult<ProfileView> {
         let choice = Self::choice(record)?;
         let proxy = match &choice {
             ProxyChoice::Global => Some(self.global_proxy.clone()),
@@ -447,6 +477,8 @@ impl ProfileService {
             saved_geo,
             browser_data_dir: self.browser_data_dir(&record.id),
             user_agent: record.fingerprint.fingerprint.navigator.user_agent.clone(),
+            note_present,
+            note_match,
         })
     }
 
@@ -583,6 +615,13 @@ impl ProfileService {
             .checked_mul(query.page_size)
             .ok_or_else(|| ProfileError::Invalid("page is too large".into()))?;
         let search = query.search.unwrap_or_default().trim().to_lowercase();
+        let notes = NoteRepository::new(self.paths.root());
+        let note_ids = notes.nonempty_ids().map_err(storage)?;
+        let note_matches = if search.is_empty() {
+            HashMap::new()
+        } else {
+            notes.matching_notes(&search).map_err(storage)?
+        };
         let filter_tags = validate_tags(&filter.tags)?;
         if search.chars().count() > 100 {
             return Err(ProfileError::Invalid("search is too long".into()));
@@ -598,6 +637,7 @@ impl ProfileService {
                     .unwrap_or("")
                     .to_lowercase()
                     .contains(&search)
+                || note_matches.contains_key(&item.id)
         });
         if !filter_tags.is_empty() || filter.proxy_mode.is_some() || filter.proxy.is_some() {
             let mut filtered = Vec::new();
@@ -633,7 +673,14 @@ impl ProfileService {
         let mut items = Vec::new();
         for item in summaries.iter().skip(offset).take(query.page_size) {
             if let Some(record) = store.load(&item.id).await.map_err(storage)? {
-                items.push(self.view(&record)?);
+                let note_match = note_matches
+                    .get(&record.id)
+                    .map(|markdown| note_snippet(markdown, &search));
+                items.push(self.view_with_note(
+                    &record,
+                    note_ids.contains(&record.id),
+                    note_match,
+                )?);
             }
         }
         Ok(ProfilePage {
@@ -1027,6 +1074,41 @@ mod tests {
             record.metadata.get("zh_cn_font"),
             cfg!(target_os = "macos").then_some(&json!("PingFang SC"))
         );
+    }
+
+    #[tokio::test]
+    async fn note_search_filters_before_paging_and_deletes_with_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProfileService::new(dir.path(), "socks5://127.0.0.1:12334").unwrap();
+        for id in ["first", "second"] {
+            service
+                .create_with_geo(
+                    input(id, id, ProxyChoice::Direct),
+                    Some(id.into()),
+                    Vec::new(),
+                    geo(),
+                )
+                .await
+                .unwrap();
+        }
+        let notes = NoteRepository::new(dir.path());
+        notes
+            .save("first", "# 客户资料\n联系人：王先生", 1)
+            .unwrap();
+        let page = service
+            .list(ProfileQuery {
+                search: Some("王先生".into()),
+                page: 1,
+                page_size: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, "first");
+        assert!(page.items[0].note_present);
+        assert_eq!(page.items[0].note_match.as_deref(), Some("联系人：王先生"));
+        service.delete("first").await.unwrap();
+        assert_eq!(notes.get("first").unwrap().markdown, "");
     }
 
     #[tokio::test]

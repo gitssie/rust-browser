@@ -65,6 +65,8 @@ mod dialogs;
 mod home;
 #[path = "ui/management_theme.rs"]
 mod management_theme;
+#[path = "ui/notes.rs"]
+mod notes;
 #[path = "ui/notifications.rs"]
 mod notifications;
 #[path = "ui/profile_actions.rs"]
@@ -75,6 +77,7 @@ mod settings_page;
 mod tag_management;
 use assets::app_logo;
 use management_theme::{management_add_button, management_row_button};
+use notes::NoteEditor;
 
 const GREEN: u32 = 0x008c68;
 const GREEN_PALE: u32 = 0xd9f8ee;

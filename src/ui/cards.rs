@@ -27,6 +27,19 @@ impl BrowserHome {
         let run_id = id.clone();
         let edit_id = id.clone();
         let delete_id = id.clone();
+        let note_repository = rust_browser::notes::NoteRepository::new(self.paths.root());
+        let note_tokio = self.tokio.clone();
+        let note_home = cx.entity();
+        let note_title = profile.name.clone().unwrap_or_else(|| id.clone());
+        let note_id = id.clone();
+        let note_holder = window
+            .use_keyed_state(
+                SharedString::from(format!("note-holder-{id}")),
+                cx,
+                |_, _| std::rc::Rc::new(std::cell::RefCell::new(None::<Entity<NoteEditor>>)),
+            )
+            .read(cx)
+            .clone();
         let os = match profile.os.as_str() {
             "macos" => "macOS",
             "windows" => "Windows",
@@ -291,12 +304,22 @@ impl BrowserHome {
                 h_flex()
                     .h(px(28.))
                     .items_center()
+                    .gap_1()
                     .child(
                         div()
                             .flex_1()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child(profile.last_opened_at.map(format_date).unwrap_or_default()),
+                            .text_ellipsis()
+                            .child(
+                                profile
+                                    .note_match
+                                    .clone()
+                                    .map(|text| format!("备注：{text}"))
+                                    .unwrap_or_else(|| {
+                                        profile.last_opened_at.map(format_date).unwrap_or_default()
+                                    }),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -333,6 +356,62 @@ impl BrowserHome {
                                         this.confirm_delete_profile(delete_id.clone(), window, cx);
                                     })),
                             ),
+                    )
+                    .child(
+                        gpui_base::Popover::new(SharedString::from(format!("profile-note-{id}")))
+                            .trigger(
+                                Button::new(SharedString::from(format!("note-{id}")))
+                                    .outline()
+                                    .xsmall()
+                                    .h(px(24.))
+                                    .w(px(24.))
+                                    .accessibility_label("编辑备注")
+                                    .tooltip("编辑备注")
+                                    .child(svg().data(notes::NOTE_ICON).size(px(14.)).text_color(
+                                        rgb(if profile.note_present { GREEN } else { INK }),
+                                    )),
+                            )
+                            .on_open_change({
+                                let holder = note_holder.clone();
+                                move |open, _, cx| {
+                                    if !*open {
+                                        let editor = holder.borrow().clone();
+                                        if let Some(editor) = editor {
+                                            let saved = editor.update(cx, |editor, cx| {
+                                                editor.flush(cx);
+                                                !editor.has_error()
+                                            });
+                                            if saved {
+                                                *holder.borrow_mut() = None;
+                                            }
+                                        }
+                                    }
+                                }
+                            })
+                            .content(move |_, window, cx| {
+                                if let Some(editor) = note_holder.borrow().clone() {
+                                    return editor;
+                                }
+                                let popover = cx.entity();
+                                let editor = cx.new(|cx| {
+                                    NoteEditor::new(
+                                        note_id,
+                                        note_title,
+                                        note_repository,
+                                        note_tokio,
+                                        note_home,
+                                        popover,
+                                        window,
+                                        cx,
+                                    )
+                                });
+                                *note_holder.borrow_mut() = Some(editor.clone());
+                                let focus_editor = editor.clone();
+                                window.defer(cx, move |window, cx| {
+                                    focus_editor.update(cx, |note, cx| note.focus(window, cx));
+                                });
+                                editor
+                            }),
                     ),
             )
             .into_any_element()

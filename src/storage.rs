@@ -63,7 +63,17 @@ fn initialize(root: &Path) -> Result<()> {
         CREATE TABLE IF NOT EXISTS tags (
             name TEXT PRIMARY KEY COLLATE NOCASE,
             color TEXT
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS profile_notes (
+            profile_id TEXT PRIMARY KEY,
+            markdown TEXT NOT NULL DEFAULT '',
+            revision INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS profile_notes_delete
+        AFTER DELETE ON personas BEGIN
+            DELETE FROM profile_notes WHERE profile_id = OLD.id;
+        END;",
     )?;
     if conn.prepare("SELECT color FROM tags LIMIT 0").is_err() {
         conn.execute("ALTER TABLE tags ADD COLUMN color TEXT", [])?;

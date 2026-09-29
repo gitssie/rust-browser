@@ -4,6 +4,7 @@ pub mod browser_manager;
 pub mod directory_management;
 pub mod geo;
 pub mod launch_progress;
+pub mod notes;
 pub mod paths;
 pub mod profiles;
 pub mod proxy;
