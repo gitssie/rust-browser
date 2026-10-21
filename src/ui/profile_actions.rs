@@ -13,13 +13,13 @@ impl BrowserHome {
         });
         self.form_os = host_profile_os();
         self.form_extra_tabs.clear();
+        self.form_url = StartupTabField::new("", &self.tab_presets.presets, window, cx);
         self.create_mode = CreateMode::Smart;
         self.geo_preview = None;
         self.geo_error.clear();
         self.geo_generation += 1;
         for input in [
             &self.form_name,
-            &self.form_url,
             &self.form_country_code,
             &self.form_country,
             &self.form_region,
@@ -46,24 +46,17 @@ impl BrowserHome {
         self.form_name.update(cx, |input, cx| {
             input.set_value(profile.name.as_deref().unwrap_or(""), window, cx)
         });
-        self.form_url.update(cx, |input, cx| {
-            input.set_value(
-                profile.tabs.first().map(String::as_str).unwrap_or(""),
-                window,
-                cx,
-            )
-        });
+        self.form_url = StartupTabField::new(
+            profile.tabs.first().map(String::as_str).unwrap_or(""),
+            &self.tab_presets.presets,
+            window,
+            cx,
+        );
         self.form_extra_tabs = profile
             .tabs
             .iter()
             .skip(1)
-            .map(|url| {
-                cx.new(|cx| {
-                    let mut input = InputState::new(window, cx).placeholder("https://example.com/");
-                    input.set_value(url, window, cx);
-                    input
-                })
-            })
+            .map(|url| StartupTabField::new(url, &self.tab_presets.presets, window, cx))
             .collect();
         let proxy_choice = profile.proxy.clone();
         let selected = match &proxy_choice {
@@ -191,7 +184,7 @@ impl BrowserHome {
             return;
         }
         let name = self.form_name.read(cx).value().trim().to_string();
-        let url = self.form_url.read(cx).value().trim().to_string();
+        let url = self.form_url.input.read(cx).value().trim().to_string();
         let choice = match self.selected_form_proxy(cx) {
             Ok(choice) => choice,
             Err(error) => {
@@ -204,7 +197,7 @@ impl BrowserHome {
             .chain(
                 self.form_extra_tabs
                     .iter()
-                    .map(|input| input.read(cx).value().trim().to_string()),
+                    .map(|field| field.input.read(cx).value().trim().to_string()),
             )
             .filter(|url| !url.is_empty())
             .collect::<Vec<_>>();

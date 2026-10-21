@@ -131,14 +131,24 @@ impl BrowserHome {
                     .rounded_md()
                     .cursor_pointer()
                     .text_color(rgb(
-                        if matches!(active, Some(SettingsTab::General | SettingsTab::Data)) {
+                        if matches!(
+                            active,
+                            Some(
+                                SettingsTab::General | SettingsTab::Data | SettingsTab::BrowserTabs
+                            )
+                        ) {
                             GREEN
                         } else {
                             INK
                         },
                     ))
                     .when(
-                        matches!(active, Some(SettingsTab::General | SettingsTab::Data)),
+                        matches!(
+                            active,
+                            Some(
+                                SettingsTab::General | SettingsTab::Data | SettingsTab::BrowserTabs
+                            )
+                        ),
                         |item| item.bg(rgb(0xe6f7f1)),
                     )
                     .child(Icon::new(IconName::Settings).size(px(18.)))
@@ -1128,6 +1138,7 @@ impl BrowserHome {
             SettingsTab::General => self.render_general_settings(cx),
             SettingsTab::Proxies => self.render_managed_settings(cx),
             SettingsTab::Tags => self.render_tag_settings(cx),
+            SettingsTab::BrowserTabs => self.render_browser_tab_settings(cx),
             SettingsTab::Data => {
                 let width: f32 = window.bounds().size.width.into();
                 self.render_data_settings(width < 1320., cx)
@@ -1140,7 +1151,7 @@ impl BrowserHome {
             .when(
                 matches!(
                     self.settings_tab,
-                    Some(SettingsTab::General | SettingsTab::Data)
+                    Some(SettingsTab::General | SettingsTab::Data | SettingsTab::BrowserTabs)
                 ),
                 |page| {
                     page.child(
@@ -1166,6 +1177,23 @@ impl BrowserHome {
                                     )
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.settings_tab = Some(SettingsTab::General);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("settings-browser-tabs")
+                                    .small()
+                                    .label("浏览器标签页")
+                                    .when(
+                                        self.settings_tab == Some(SettingsTab::BrowserTabs),
+                                        |button| button.primary(),
+                                    )
+                                    .when(
+                                        self.settings_tab != Some(SettingsTab::BrowserTabs),
+                                        |button| button.ghost(),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.settings_tab = Some(SettingsTab::BrowserTabs);
                                         cx.notify();
                                     })),
                             )

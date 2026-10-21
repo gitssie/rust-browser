@@ -1044,6 +1044,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_tab_presets_copy_urls_without_becoming_profile_tags() {
+        use crate::browser_tabs::BrowserTabSettings;
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProfileService::new(dir.path(), "socks5://127.0.0.1:12334").unwrap();
+        let mut settings = BrowserTabSettings::load(dir.path()).unwrap();
+        let urls = vec![
+            settings.presets[0].url.clone(),
+            "https://example.com/".into(),
+        ];
+        let created = service
+            .create_with_geo(
+                input("startup-tabs", "Tabs", ProxyChoice::Direct),
+                Some("Tabs".into()),
+                urls.clone(),
+                geo(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.tabs, urls);
+        assert!(created.tags.is_empty());
+        settings.presets[0].url = "https://www.vinted.fr/catalog".into();
+        settings.save(dir.path()).unwrap();
+        let saved = service
+            .store()
+            .unwrap()
+            .require("startup-tabs")
+            .await
+            .unwrap();
+        assert_eq!(saved_tabs(&saved).unwrap(), urls);
+        assert!(
+            BrowserTabSettings::load(dir.path()).unwrap().presets[0]
+                .url
+                .ends_with("/catalog")
+        );
+    }
+
+    #[tokio::test]
     async fn created_chinese_profile_does_not_save_host_font_override() {
         let dir = tempfile::tempdir().unwrap();
         let service = ProfileService::new(dir.path(), "socks5://127.0.0.1:12334").unwrap();

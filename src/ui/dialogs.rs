@@ -321,7 +321,11 @@ impl BrowserHome {
                             })),
                     ),
             )
-            .child(form_field("名称", &self.form_name, cx))
+            .child(
+                h_form()
+                    .label_width(px(100.))
+                    .child(field().label("名称").child(Input::new(&self.form_name))),
+            )
             .child(self.render_tabs_field(cx))
             .child(
                 h_flex()
@@ -400,19 +404,21 @@ impl BrowserHome {
         let extra_rows = self
             .form_extra_tabs
             .iter()
-            .cloned()
             .enumerate()
             .map(|(index, input)| {
                 h_flex()
+                    .w_full()
                     .items_center()
                     .gap_2()
-                    .child(div().w(px(100.)))
-                    .child(div().flex_1().child(Input::new(&input)))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex_1()
+                            .child(self.render_startup_tab_input(input)),
+                    )
                     .child(
                         Button::new(("remove-startup-tab", index))
                             .outline()
-                            .small()
-                            .w(px(72.))
                             .label("移除")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.form_extra_tabs.remove(index);
@@ -422,35 +428,46 @@ impl BrowserHome {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        v_flex()
-            .gap_2()
+        h_form()
+            .label_width(px(100.))
             .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
+                field()
+                    .label("启动标签页")
+                    .description("浏览器启动时，每个网址分别打开一个 Tab。")
                     .child(
-                        div()
-                            .w(px(100.))
-                            .text_sm()
-                            .text_color(rgb(INK))
-                            .child("标签页"),
-                    )
-                    .child(div().flex_1().child(Input::new(&self.form_url)))
-                    .child(
-                        Button::new("add-startup-tab")
-                            .outline()
-                            .small()
-                            .w(px(72.))
-                            .label("添加")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.form_extra_tabs.push(cx.new(|cx| {
-                                    InputState::new(window, cx).placeholder("https://example.com/")
-                                }));
-                                cx.notify();
-                            })),
+                        v_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .flex_1()
+                                            .child(self.render_startup_tab_input(&self.form_url)),
+                                    )
+                                    .child(
+                                        Button::new("add-startup-tab")
+                                            .outline()
+                                            .label("添加")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                let field = StartupTabField::new(
+                                                    "",
+                                                    &this.tab_presets.presets,
+                                                    window,
+                                                    cx,
+                                                );
+                                                this.form_extra_tabs.push(field);
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .children(extra_rows),
                     ),
             )
-            .children(extra_rows)
             .into_any_element()
     }
 
@@ -475,7 +492,11 @@ impl BrowserHome {
                         .child(div().w(px(100.)).text_sm().text_color(rgb(INK)).child("ID"))
                         .child(div().text_sm().text_color(rgb(MUTED)).child(id)),
                 )
-                .child(form_field("名称", &self.form_name, cx))
+                .child(
+                    h_form()
+                        .label_width(px(100.))
+                        .child(field().label("名称").child(Input::new(&self.form_name))),
+                )
                 .child(self.render_tabs_field(cx))
                 .child(
                     h_flex()
@@ -505,11 +526,7 @@ impl BrowserHome {
                 && (self.geo_loading || self.geo_preview.is_none()));
         let card =
             v_flex()
-                .w(px(if matches!(dialog, Dialog::Create) {
-                    640.
-                } else {
-                    520.
-                }))
+                .w(px(640.))
                 .max_h(window.bounds().size.height - px(48.))
                 .p_5()
                 .gap_4()

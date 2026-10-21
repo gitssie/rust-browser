@@ -122,6 +122,14 @@ crates remain Cargo dependencies.
 a new Canvas image salt at every launch; this also removes its per-site Canvas
 variation for this profile.
 
+In the native manager, **全局设置 → 浏览器标签页** manages named startup-URL
+presets. The initial preset is `bacon` → `https://www.vinted.fr/`. Each startup-tab
+row in the create/edit form has a standard gpui-components `Select` and an
+editable URL input. Choosing a preset copies its URL into that row; each saved
+URL opens as a browser tab. Preset changes do not rewrite existing profiles.
+Presets are stored in the application SQLite settings, and deleting all of them
+keeps the list empty after restart. Profile classification tags are separate.
+
 `create --tab` and `tabs --set` accept repeated URLs. `open --url` overrides the
 saved tabs for that launch. Without saved tabs, `open` starts at `about:blank`.
 Only `scan` navigates to BrowserScan. `create` prints its generated eight-character

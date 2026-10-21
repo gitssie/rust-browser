@@ -1,6 +1,7 @@
 //! Native profile management API for the CLI and a future Rust UI.
 
 pub mod browser_manager;
+pub mod browser_tabs;
 pub mod directory_management;
 pub mod geo;
 pub mod launch_progress;

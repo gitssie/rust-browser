@@ -19,6 +19,7 @@ use gpui_component::{
     checkbox::Checkbox,
     color_picker::{ColorPicker, ColorPickerState},
     dialog::DialogButtonProps,
+    form::{field, h_form},
     h_flex,
     input::{Input, InputEvent, InputState},
     notification::Notification,
@@ -34,6 +35,7 @@ use rand::Rng as _;
 use rust_browser::browser_manager::{
     BrowserManager, DownloadControl, DownloadProgress, DownloadStage, InstalledVersion, Release,
 };
+use rust_browser::browser_tabs::{BrowserTabPreset, BrowserTabSettings};
 use rust_browser::directory_management::{copy_storage, remove_source_storage};
 use rust_browser::geo::ProfileGeo;
 use rust_browser::launch_progress::{LaunchEvent, LaunchStage, read_events};
@@ -73,11 +75,14 @@ mod notifications;
 mod profile_actions;
 #[path = "ui/settings_page.rs"]
 mod settings_page;
+#[path = "ui/startup_tabs.rs"]
+mod startup_tabs;
 #[path = "ui/tag_management.rs"]
 mod tag_management;
 use assets::app_logo;
 use management_theme::{management_add_button, management_row_button};
 use notes::NoteEditor;
+use startup_tabs::StartupTabField;
 
 const GREEN: u32 = 0x008c68;
 const GREEN_PALE: u32 = 0xd9f8ee;
@@ -346,6 +351,7 @@ enum SettingsTab {
     Proxies,
     Tags,
     Data,
+    BrowserTabs,
 }
 
 #[derive(Clone, Copy)]
@@ -538,6 +544,12 @@ struct BrowserHome {
     workspace_lock: Arc<WorkspaceLock>,
     settings_tab: Option<SettingsTab>,
     general: GeneralSettings,
+    tab_presets: BrowserTabSettings,
+    tab_preset_edit: Option<usize>,
+    tab_preset_name: Entity<InputState>,
+    tab_preset_url: Entity<InputState>,
+    tab_presets_status: String,
+    tab_presets_error: bool,
     general_host: Entity<InputState>,
     general_port: Entity<InputState>,
     general_username: Entity<InputState>,
@@ -578,8 +590,8 @@ struct BrowserHome {
     managed_generation: u64,
     search: Entity<InputState>,
     form_name: Entity<InputState>,
-    form_url: Entity<InputState>,
-    form_extra_tabs: Vec<Entity<InputState>>,
+    form_url: StartupTabField,
+    form_extra_tabs: Vec<StartupTabField>,
     form_proxy_select: Entity<SelectState<Vec<ProfileProxyOption>>>,
     form_country_code: Entity<InputState>,
     form_country: Entity<InputState>,
@@ -1315,10 +1327,23 @@ impl BrowserHome {
             browser_download: browser_download_settings,
             workspace_lock,
         } = initial_settings;
+        let (tab_presets, tab_presets_status, tab_presets_error) =
+            match BrowserTabSettings::load(service.data_dir()) {
+                Ok(settings) => (settings, String::new(), false),
+                Err(error) => (
+                    BrowserTabSettings {
+                        presets: Vec::new(),
+                    },
+                    format!("读取常用标签页失败：{error}"),
+                    true,
+                ),
+            };
+        let tab_preset_name = cx.new(|cx| InputState::new(window, cx).placeholder("例如：bacon"));
+        let tab_preset_url =
+            cx.new(|cx| InputState::new(window, cx).placeholder("例如：www.vinted.fr"));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索"));
         let form_name = cx.new(|cx| InputState::new(window, cx).placeholder("显示名称"));
-        let form_url =
-            cx.new(|cx| InputState::new(window, cx).placeholder("https://www.vinted.fr/"));
+        let form_url = StartupTabField::new("", &tab_presets.presets, window, cx);
         let managed = ProxyCatalog::new(service.data_dir())
             .list()
             .unwrap_or_default();
@@ -1442,6 +1467,12 @@ impl BrowserHome {
             workspace_lock,
             settings_tab: None,
             general,
+            tab_presets,
+            tab_preset_edit: None,
+            tab_preset_name,
+            tab_preset_url,
+            tab_presets_status,
+            tab_presets_error,
             general_host,
             general_port,
             general_username,
