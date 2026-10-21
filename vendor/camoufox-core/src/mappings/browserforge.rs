@@ -110,8 +110,6 @@ pub fn handle_screen_xy(
     out: &mut Map<String, Value>,
     screen: &veilus_fingerprint::ScreenFingerprint,
 ) {
-    use rand::Rng;
-
     if out.contains_key("window.screenY") {
         return;
     }
@@ -134,14 +132,9 @@ pub fn handle_screen_xy(
         .map(u64::from)
         .unwrap_or(u64::from(screen.avail_height)) as i64;
     let screen_y = avail_height - outer_height;
-    let value = if screen_y == 0 {
-        0
-    } else if screen_y > 0 {
-        rand::thread_rng().gen_range(0..=screen_y)
-    } else {
-        rand::thread_rng().gen_range(screen_y..=0)
-    };
-    out.insert("window.screenY".into(), Value::from(value));
+    // Align to the saved available area instead of drawing a new random
+    // window offset every time the same persona is converted.
+    out.insert("window.screenY".into(), Value::from(screen_y));
 }
 
 /// Converts a generated BrowserForge-compatible profile into the Camoufox
@@ -208,8 +201,21 @@ pub fn cast_to_properties(
     }
 
     // screen.* / window.* dimensions
-    put_num(out, "screen.availLeft", screen.avail_left.map(f64::from));
-    put_num(out, "screen.availTop", screen.avail_top.map(f64::from));
+    // These fields must include zero: put_num intentionally skips zero-valued
+    // samples, which would leave the host display offset observable here.
+    out.insert(
+        "screen.availLeft".into(),
+        Value::from(screen.avail_left.unwrap_or(0)),
+    );
+    out.insert(
+        "screen.availTop".into(),
+        Value::from(screen.avail_top.unwrap_or(0)),
+    );
+    put_num(
+        out,
+        "window.devicePixelRatio",
+        Some(f64::from(screen.device_pixel_ratio)),
+    );
     put_num(
         out,
         "screen.availWidth",
@@ -354,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn screen_xy_large_offset_is_random_in_range() {
+    fn screen_xy_large_offset_uses_saved_geometry() {
         let mut screen = default_screen();
         screen.screen_x = Some(500);
         screen.avail_height = 1040;
@@ -363,7 +369,7 @@ mod tests {
             let mut out = Map::new();
             handle_screen_xy(&mut out, &screen);
             let y = out.get("window.screenY").unwrap().as_i64().unwrap();
-            assert!((0..=40).contains(&y));
+            assert_eq!(y, 40);
         }
     }
 

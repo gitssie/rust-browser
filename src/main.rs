@@ -26,9 +26,7 @@ use rust_browser::browser_manager::{
 use rust_browser::geo::ProfileGeo;
 use rust_browser::launch_progress::{LaunchEvent, LaunchProgressWriter, LaunchStage};
 use rust_browser::paths::AppPaths as Paths;
-use rust_browser::profiles::{
-    CreateProfile, ProfileOs, ProfileScreen, ProfileService, ProxyChoice,
-};
+use rust_browser::profiles::{CreateProfile, ProfileOs, ProfileService, ProxyChoice};
 use rust_browser::proxy::ProxySettings;
 use rust_browser::proxy_management::{
     IpSwitch, ManagedProxy, ProxyCatalog, ProxyPolicy, SwitchMethod,
@@ -687,33 +685,9 @@ async fn pinned_launch_options(
 
 /// Keep screen identity pinned while the page viewport follows native resizes.
 fn use_native_viewport(paths: &Paths, prepared: &mut PreparedLaunch) -> Result<bool> {
-    let screen = std::env::var("RUST_BROWSER_DISPLAY_SCREEN")
-        .ok()
-        .map(|encoded| serde_json::from_str::<ProfileScreen>(&encoded))
-        .transpose()
-        .context("invalid display screen dimensions")?;
-    use_native_viewport_with_screen(paths, prepared, screen)
-}
-
-fn use_native_viewport_with_screen(
-    paths: &Paths,
-    prepared: &mut PreparedLaunch,
-    screen: Option<ProfileScreen>,
-) -> Result<bool> {
     let mut changed = false;
     for key in WINDOW_DIM_KEYS {
         changed |= prepared.config.remove(*key).is_some();
-    }
-    if let Some(screen) = screen {
-        if screen.width < 800
-            || screen.height < 600
-            || screen.avail_width > screen.width
-            || screen.avail_height > screen.height
-        {
-            bail!("invalid display screen dimensions");
-        }
-        screen.apply_to_config(&mut prepared.config);
-        changed = true;
     }
     prepared.spoofs_window_dimensions = false;
     if changed {
@@ -810,13 +784,6 @@ fn update_launch_geo(paths: &Paths, prepared: &mut PreparedLaunch, geo: &Profile
         .and_then(Value::as_str)
         .context("saved launch has no user agent")?;
     let target_os = determine_ua_os(user_agent)?;
-    prepared.config.insert(
-        "fonts".into(),
-        json!(camoufox_core::mappings::fonts::fonts_for_locale(
-            target_os,
-            &geo.locale
-        )),
-    );
     prepared
         .env
         .retain(|key, _| !key.starts_with("CAMOU_CONFIG_"));
@@ -1299,48 +1266,273 @@ mod tests {
         );
     }
 
-    #[test]
-    fn refreshing_region_updates_fonts_for_the_simulated_os() {
+    #[tokio::test]
+    async fn french_profile_uses_native_os_fonts_and_reuses_pinned_identity() {
+        for os in [SupportedOs::Windows, SupportedOs::Macos, SupportedOs::Linux] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+            std::fs::create_dir_all(paths.browser()).unwrap();
+            let executable = paths.browser().join("camoufox");
+            std::fs::write(&executable, []).unwrap();
+            std::fs::write(
+                paths.browser().join("properties.json"),
+                include_str!("../tests/fixtures/camoufox-152-properties.json"),
+            )
+            .unwrap();
+            let resources = if cfg!(target_os = "macos") {
+                paths.browser().join("Camoufox.app/Contents/Resources")
+            } else {
+                paths.browser()
+            };
+            let addon = resources.join("addons/UBO");
+            std::fs::create_dir_all(&addon).unwrap();
+            std::fs::write(addon.join("manifest.json"), "{}").unwrap();
+            let installation = ActiveInstallation {
+                root: paths.browser(),
+                version: CamoufoxVersion::new("beta.31", Some("152.0.4".into())),
+                executable_path: dunce::canonicalize(executable).unwrap(),
+            };
+            let mut persona = PersonaRecord::generate(
+                "france",
+                &FingerprintRequest {
+                    operating_systems: Some(vec![os]),
+                    seed: Some(42),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // Include a fractional ratio to catch precision changes on reload.
+            persona.fingerprint.fingerprint.screen.device_pixel_ratio = 1.3234376;
+            persona.metadata.insert("os".into(), json!(os.as_str()));
+            let geo = ProfileGeo {
+                ip: "203.0.113.1".into(),
+                country_code: "FR".into(),
+                country: "France".into(),
+                region: None,
+                region_code: None,
+                city: Some("Paris".into()),
+                timezone: "Europe/Paris".into(),
+                latitude: 48.8566,
+                longitude: 2.3522,
+                locale: "fr-FR".into(),
+                source: "test".into(),
+            };
+            // Creation's saved persona seed must determine all launch choices,
+            // even before the first PreparedLaunch has been cached.
+            let mut unpinned =
+                launch_options(&paths, "france", persona.clone(), None, &installation).unwrap();
+            unpinned.geolocation_override = Some(geo.as_geolocation().unwrap());
+            let initial = prepare(&unpinned).await.unwrap();
+            let repeated = prepare(&unpinned).await.unwrap();
+            assert_eq!(
+                initial.config, repeated.config,
+                "unprepared identity changed for {os:?}"
+            );
+            let first =
+                pinned_launch_options(&paths, "france", &mut persona, &geo, None, &installation)
+                    .await
+                    .unwrap()
+                    .prepared_override
+                    .unwrap();
+            assert_eq!(first.config["locale:language"], json!("fr"));
+            assert_eq!(first.config["locale:region"], json!("FR"));
+            assert_eq!(first.config["timezone"], json!("Europe/Paris"));
+            assert_eq!(
+                first.config["fonts"],
+                json!(camoufox_core::mappings::fonts::fonts_for(os.to_os_name()))
+            );
+            assert_eq!(
+                first.config["screen.width"],
+                json!(persona.fingerprint.fingerprint.screen.width)
+            );
+            assert_eq!(
+                first.config["screen.height"],
+                json!(persona.fingerprint.fingerprint.screen.height)
+            );
+            assert_eq!(
+                first.config["screen.availLeft"],
+                json!(
+                    persona
+                        .fingerprint
+                        .fingerprint
+                        .screen
+                        .avail_left
+                        .unwrap_or(0)
+                )
+            );
+            assert_eq!(
+                first.config["screen.availTop"],
+                json!(
+                    persona
+                        .fingerprint
+                        .fingerprint
+                        .screen
+                        .avail_top
+                        .unwrap_or(0)
+                )
+            );
+            assert_eq!(
+                first.config["window.devicePixelRatio"].as_f64(),
+                Some(f64::from(
+                    persona.fingerprint.fingerprint.screen.device_pixel_ratio
+                ))
+            );
+            assert!(
+                first
+                    .firefox_user_prefs
+                    .keys()
+                    .all(|key| !key.starts_with("font.name"))
+            );
+            for key in ["fonts:spacing_seed", "audio:seed", "canvas:seed"] {
+                assert!(
+                    first.config[key].as_u64().is_some_and(|seed| seed > 0),
+                    "missing {key}"
+                );
+            }
+            // Reload from disk, as a fresh application process would.
+            let mut saved = storage::open_store(paths.root())
+                .unwrap()
+                .require("france")
+                .await
+                .unwrap();
+            let second =
+                pinned_launch_options(&paths, "france", &mut saved, &geo, None, &installation)
+                    .await
+                    .unwrap()
+                    .prepared_override
+                    .unwrap();
+            for (key, value) in &first.config {
+                assert_eq!(
+                    Some(value),
+                    second.config.get(key),
+                    "persisted field {key} changed for {os:?}"
+                );
+            }
+            assert_eq!(first.env, second.env);
+            let actual = prepare(&LaunchOptions {
+                prepared_override: Some(second),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            assert_eq!(actual.config, first.config);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local Camoufox installation via RUST_BROWSER_LIVE_INSTALL"]
+    async fn french_live_identity_survives_browser_restart() {
+        let root = PathBuf::from(std::env::var("RUST_BROWSER_LIVE_INSTALL").unwrap());
+        let executable = if cfg!(target_os = "macos") {
+            root.join("Camoufox.app/Contents/MacOS/camoufox")
+        } else if cfg!(windows) {
+            root.join("camoufox.exe")
+        } else {
+            root.join("camoufox")
+        };
+        let installation = ActiveInstallation {
+            version: CamoufoxVersion::from_path(&root).unwrap(),
+            executable_path: dunce::canonicalize(executable).unwrap(),
+            root,
+        };
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
-        let mut prepared = PreparedLaunch {
-            executable_path: paths.browser().join("camoufox.exe"),
-            env: BTreeMap::new(),
-            firefox_user_prefs: BTreeMap::new(),
-            args: Vec::new(),
-            proxy: None,
-            proxy_bypass: None,
-            spoofs_window_dimensions: false,
-            config: serde_json::from_value(json!({
-                "navigator.userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/152.0",
-                "fonts": ["PingFang SC"],
-            })).unwrap(),
-        };
-        let mut geo = ProfileGeo {
+        let mut persona = PersonaRecord::generate(
+            "france-live",
+            &FingerprintRequest {
+                operating_systems: Some(vec![SupportedOs::Windows]),
+                seed: Some(13579),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        persona.metadata.insert("os".into(), json!("windows"));
+        let geo = ProfileGeo {
             ip: "203.0.113.1".into(),
-            country_code: "CN".into(),
-            country: "China".into(),
+            country_code: "FR".into(),
+            country: "France".into(),
             region: None,
             region_code: None,
-            city: None,
-            timezone: "Asia/Shanghai".into(),
-            latitude: 31.2,
-            longitude: 121.5,
-            locale: "zh-CN".into(),
+            city: Some("Paris".into()),
+            timezone: "Europe/Paris".into(),
+            latitude: 48.8566,
+            longitude: 2.3522,
+            locale: "fr-FR".into(),
             source: "test".into(),
         };
-        update_launch_geo(&paths, &mut prepared, &geo).unwrap();
-        let fonts = prepared.config["fonts"].as_array().unwrap();
-        assert!(fonts.contains(&json!("Microsoft YaHei")));
-        assert!(!fonts.contains(&json!("PingFang SC")));
-        geo.locale = "fr-FR".into();
-        geo.timezone = "Europe/Paris".into();
-        update_launch_geo(&paths, &mut prepared, &geo).unwrap();
-        assert_eq!(prepared.config["locale:language"], json!("fr"));
-        let fonts = prepared.config["fonts"].as_array().unwrap();
-        assert!(fonts.contains(&json!("Arial")));
-        assert!(!fonts.contains(&json!("Microsoft YaHei")));
-        assert!(!prepared.env.is_empty());
+        let mut observed = Vec::new();
+        for _ in 0..2 {
+            let mut options = pinned_launch_options(
+                &paths,
+                "france-live",
+                &mut persona,
+                &geo,
+                None,
+                &installation,
+            )
+            .await
+            .unwrap();
+            options.headless = HeadlessMode::On;
+            let mut browser = launch_with_juggler(&options).await.unwrap();
+            let result = async {
+                let page = browser.new_page().await?;
+                page.goto("data:text/html,<title>French identity probe</title>").await?;
+                // Run the probe as normal page JS; the automation sandbox's
+                // Xray wrappers do not allow direct TypedArray/audio access.
+                let script = format!("{}.then(value => document.documentElement.setAttribute('data-identity', JSON.stringify(value))).catch(error => document.documentElement.setAttribute('data-error', String(error)))", include_str!("../tests/fixtures/identity-probe.js").trim());
+                page.evaluate(&format!("(() => {{ const script = document.createElement('script'); script.textContent = {}; document.documentElement.appendChild(script); }})()", serde_json::to_string(&script).unwrap())).await?;
+                for _ in 0..100 {
+                    let error = page.evaluate("document.documentElement.getAttribute('data-error')").await?;
+                    if !error.is_null() {
+                        return Err(camoufox_juggler::JugglerError::Protocol(format!("identity probe failed: {error}")));
+                    }
+                    let result = page.evaluate("document.documentElement.getAttribute('data-identity')").await?;
+                    if let Some(encoded) = result.as_str() {
+                        return Ok::<Value, camoufox_juggler::JugglerError>(serde_json::from_str(encoded).unwrap());
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(camoufox_juggler::JugglerError::Protocol("identity probe did not complete".into()))
+            }
+            .await;
+            browser.close().await.unwrap();
+            observed.push(result.unwrap());
+            persona = storage::open_store(paths.root())
+                .unwrap()
+                .require("france-live")
+                .await
+                .unwrap();
+        }
+        assert!(
+            observed[0]["canvas"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png")
+        );
+        assert!(
+            observed[0]["audio"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|sample| sample.as_f64().unwrap() != 0.0)
+        );
+        assert_eq!(observed[0]["metrics"].as_object().unwrap().len(), 7);
+        assert!(observed[0]["webgl"].is_array());
+        assert_eq!(
+            observed[0]["devicePixelRatio"].as_f64(),
+            Some(f64::from(
+                persona.fingerprint.fingerprint.screen.device_pixel_ratio
+            ))
+        );
+        assert_eq!(observed[0]["language"], json!("fr-FR"));
+        assert_eq!(observed[0]["timezone"], json!("Europe/Paris"));
+        for (key, value) in observed[0].as_object().unwrap() {
+            assert_eq!(
+                Some(value),
+                observed[1].get(key),
+                "live {key} changed after restart"
+            );
+        }
     }
 
     #[test]
@@ -1408,26 +1600,6 @@ mod tests {
         assert_eq!(encoded["screen.width"], 1920);
         assert!(encoded.get("window.innerWidth").is_none());
         assert!(!use_native_viewport(&paths, &mut prepared).unwrap());
-
-        let screen = ProfileScreen {
-            width: 2560,
-            height: 1440,
-            avail_width: 2560,
-            avail_height: 1400,
-            avail_left: 0,
-            avail_top: 40,
-        };
-        assert!(use_native_viewport_with_screen(&paths, &mut prepared, Some(screen)).unwrap());
-        assert_eq!(prepared.config.get("screen.width"), Some(&json!(2560)));
-        assert_eq!(prepared.config.get("screen.height"), Some(&json!(1440)));
-        assert_eq!(
-            prepared.config.get("screen.availHeight"),
-            Some(&json!(1400))
-        );
-        let encoded: serde_json::Value =
-            serde_json::from_str(&prepared.env["CAMOU_CONFIG_1"]).unwrap();
-        assert_eq!(encoded["screen.width"], 2560);
-        assert_eq!(encoded["screen.availHeight"], 1400);
     }
 
     #[test]

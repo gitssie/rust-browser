@@ -111,7 +111,7 @@ impl BrowserHome {
         .detach();
     }
 
-    pub(super) fn open_browser(&mut self, id: String, window: &Window, cx: &mut Context<Self>) {
+    pub(super) fn open_browser(&mut self, id: String, _window: &Window, cx: &mut Context<Self>) {
         if self.browser_busy {
             self.pending_notice = Some(Notification::info("浏览器版本正在安装，请稍后打开"));
             cx.notify();
@@ -129,7 +129,6 @@ impl BrowserHome {
             profile.saved_geo.country,
             profile.saved_geo.city.as_deref().unwrap_or("-")
         );
-        let screen = profile_screen(window, cx);
         let result = (|| -> Result<(Child, PathBuf)> {
             let exe = std::env::current_exe()?;
             let log_dir = self.paths.logs();
@@ -158,12 +157,6 @@ impl BrowserHome {
             // The native manager uses the saved general proxy, including its
             // credentials, even if the manager inherited a CLI proxy override.
             command.env_remove("RUST_BROWSER_PROXY");
-            if let Some(screen) = screen {
-                command.env(
-                    "RUST_BROWSER_DISPLAY_SCREEN",
-                    serde_json::to_string(&screen)?,
-                );
-            }
             #[cfg(unix)]
             command.process_group(0);
             let mut child = match command.spawn() {

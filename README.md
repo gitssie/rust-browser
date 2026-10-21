@@ -100,13 +100,23 @@ allow direct traffic. Firefox proxy preferences are also written before startup.
 
 The first `open` or `scan` saves camoufox-rust's complete `PreparedLaunch`,
 including Canvas, WebGL, audio, font noise, locale, and timezone. Later launches
-reuse it. A different browser version or installation path requires restoring
+reuse it. The persona seed saved at creation also determines font/audio/Canvas
+noise seeds and WebGL selection before the first launch is pinned. Screen
+identity comes from the saved persona; moving the manager to another display
+or changing the host resolution does not overwrite it on launch. The actual
+browser window can still be resized normally.
+Fonts use Camoufox's built-in list for the simulated OS, independently of the
+host OS. A French profile uses its saved `fr-FR` locale and `Europe/Paris`
+timezone; no hand-picked French font whitelist or forced PingFang override is
+applied. Built-in OS lists may include multilingual fonts.
+A different browser version or installation path requires restoring
 a compatible browser installation for that pinned identity.
 All eight camoufox-rust 0.9.1 crates used by this CLI are pinned in `vendor/`.
 `vendor/camoufox` has patches to reuse the saved preparation through Juggler
 and apply saved GeoIP configuration; `vendor/camoufox-core` chooses the dominant
 country locale; `vendor/camoufox-juggler` cleans up Firefox when startup fails
-after spawn. Other crates are currently unchanged upstream copies. Third-party
+after spawn. `vendor/camoufox-webgl` accepts the persona RNG for stable GPU
+selection. Other crates are currently unchanged upstream copies. Third-party
 crates remain Cargo dependencies.
 `privacy.baselineFingerprintingProtection=false` prevents Firefox from adding
 a new Canvas image salt at every launch; this also removes its per-site Canvas

@@ -15,6 +15,7 @@ use camoufox_core::fingerprint::{
 use camoufox_core::locale::handle_locales;
 use camoufox_core::mappings::warnings;
 use camoufox_core::os::{host_os, SupportedOs};
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -210,6 +211,18 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
     if let Some(prepared) = &options.prepared_override {
         return Ok(prepared.clone());
     }
+    // A saved persona seed determines all identity choices, including those
+    // resolved before the first PreparedLaunch is persisted. Unseeded callers
+    // retain the normal random launch behavior.
+    let seed = options
+        .persona
+        .as_ref()
+        .and_then(|persona| persona.seed)
+        .or(options.fingerprint_seed);
+    let mut rng = match seed {
+        Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
+        None => rand::rngs::StdRng::from_entropy(),
+    };
     let mut config: ConfigMap = ConfigMap::new();
     let mut firefox_user_prefs = options.firefox_user_prefs.clone();
     let install_root = options
@@ -308,7 +321,7 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
             set_into(
                 &mut config,
                 seed,
-                Value::from(camoufox_core::config::random_seed() as u64),
+                Value::from(rng.gen_range(1..=u32::MAX) as u64),
             );
         }
     }
@@ -323,8 +336,50 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
     set_into(
         &mut config,
         "window.history.length",
-        Value::from(rand::Rng::gen_range(&mut rand::thread_rng(), 1..=5)),
+        Value::from(rng.gen_range(1..=5)),
     );
+
+    // Fonts.
+    if !options.fonts.is_empty() {
+        config.insert(
+            "fonts".into(),
+            Value::Array(
+                options
+                    .fonts
+                    .iter()
+                    .map(|f| Value::String(f.clone()))
+                    .collect(),
+            ),
+        );
+    }
+
+    if options.custom_fonts_only {
+        firefox_user_prefs.insert("gfx.bundled-fonts.activate".into(), Value::from(0));
+        if !options.fonts.is_empty() {
+            warnings::warn_leak("custom_fonts_only", Some(options.i_know_what_im_doing));
+        } else {
+            return Err(CamoufoxError::Io(
+                "No custom fonts were passed, but `custom_fonts_only` is enabled.".into(),
+            ));
+        }
+    } else {
+        let os_fonts = camoufox_core::mappings::fonts::fonts_for(target_os);
+        let merged: Vec<Value> = {
+            let mut seen = std::collections::HashSet::new();
+            let mut list: Vec<Value> = Vec::new();
+            for font in os_fonts
+                .iter()
+                .map(|f| (*f).to_string())
+                .chain(options.fonts.clone())
+            {
+                if seen.insert(font.clone()) {
+                    list.push(Value::String(font));
+                }
+            }
+            list
+        };
+        config.insert("fonts".into(), Value::Array(merged));
+    }
 
     // Proxy URL.
     let proxy_url = options.proxy.as_ref().map(proxy_to_url);
@@ -374,65 +429,6 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
         handle_locales(&options.locale, &mut config)?;
     }
 
-    // Fonts.
-    if !options.fonts.is_empty() {
-        config.insert(
-            "fonts".into(),
-            Value::Array(
-                options
-                    .fonts
-                    .iter()
-                    .map(|f| Value::String(f.clone()))
-                    .collect(),
-            ),
-        );
-    }
-
-    if options.custom_fonts_only {
-        firefox_user_prefs.insert("gfx.bundled-fonts.activate".into(), Value::from(0));
-        if !options.fonts.is_empty() {
-            warnings::warn_leak("custom_fonts_only", Some(options.i_know_what_im_doing));
-        } else {
-            return Err(CamoufoxError::Io(
-                "No custom fonts were passed, but `custom_fonts_only` is enabled.".into(),
-            ));
-        }
-    } else {
-        let language = config
-            .get("locale:language")
-            .and_then(Value::as_str)
-            .unwrap_or("en");
-        let script = config
-            .get("locale:script")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let region = config
-            .get("locale:region")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let locale = [language, script, region]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("-");
-        let os_fonts = camoufox_core::mappings::fonts::fonts_for_locale(target_os, &locale);
-        let merged: Vec<Value> = {
-            let mut seen = std::collections::HashSet::new();
-            let mut list: Vec<Value> = Vec::new();
-            for font in os_fonts
-                .iter()
-                .map(|f| (*f).to_string())
-                .chain(options.fonts.clone())
-            {
-                if seen.insert(font.clone()) {
-                    list.push(Value::String(font));
-                }
-            }
-            list
-        };
-        config.insert("fonts".into(), Value::Array(merged));
-    }
-
     // Humanize.
     if let Some(max_time) = options.humanize {
         set_into(&mut config, "humanize", Value::Bool(true));
@@ -467,7 +463,7 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
         firefox_user_prefs.insert("webgl.disabled".into(), Value::Bool(true));
         warnings::warn_leak("block_webgl", Some(options.i_know_what_im_doing));
     } else {
-        let webgl = camoufox_webgl::sample_webgl(target_os, None, None)?;
+        let webgl = camoufox_webgl::sample_webgl_with_rng(target_os, None, None, &mut rng)?;
         for (key, value) in &webgl.config {
             if !config.contains_key(key) {
                 config.insert(key.clone(), value.clone());
@@ -484,7 +480,7 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
     set_into(
         &mut config,
         "canvas:aaOffset",
-        Value::from(rand::Rng::gen_range(&mut rand::thread_rng(), -50..=50)),
+        Value::from(rng.gen_range(-50..=50)),
     );
     set_into(&mut config, "canvas:aaCapOffset", Value::Bool(true));
 

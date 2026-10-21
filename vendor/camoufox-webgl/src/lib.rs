@@ -42,6 +42,17 @@ pub fn sample_webgl(
     vendor: Option<&str>,
     renderer: Option<&str>,
 ) -> Result<WebGLFingerprint> {
+    sample_webgl_with_rng(os, vendor, renderer, &mut rand::thread_rng())
+}
+
+/// Samples with a caller-owned RNG so a persisted persona can reproduce its
+/// vendor/renderer choice before the complete launch config is pinned.
+pub fn sample_webgl_with_rng(
+    os: OsName,
+    vendor: Option<&str>,
+    renderer: Option<&str>,
+    rng: &mut impl Rng,
+) -> Result<WebGLFingerprint> {
     let conn = open_embedded_db()?;
 
     let os_column = os.as_str();
@@ -77,7 +88,7 @@ pub fn sample_webgl(
         _ => {
             let mut statement = conn
                 .prepare(&format!(
-                    "SELECT data, {os_column} FROM webgl_fingerprints WHERE {os_column} > 0"
+                    "SELECT data, {os_column} FROM webgl_fingerprints WHERE {os_column} > 0 ORDER BY vendor, renderer"
                 ))
                 .map_err(|e| CamoufoxError::Sqlite(e.to_string()))?;
             let rows: Vec<(String, f64)> = statement
@@ -93,7 +104,7 @@ pub fn sample_webgl(
             }
 
             let weights: Vec<f64> = rows.iter().map(|(_, w)| *w).collect();
-            let idx = weighted_random_choice(&weights);
+            let idx = weighted_random_choice(&weights, rng);
             parse_sample(&rows[idx].0)
         }
     }
@@ -163,7 +174,7 @@ fn possible_pairs_error(
     let os_column = os.as_str();
     let mut statement = conn
         .prepare(&format!(
-            "SELECT DISTINCT vendor, renderer FROM webgl_fingerprints WHERE {os_column} > 0"
+            "SELECT DISTINCT vendor, renderer FROM webgl_fingerprints WHERE {os_column} > 0 ORDER BY vendor, renderer"
         ))
         .map_err(|e| CamoufoxError::Sqlite(e.to_string()))?;
     let pairs: Vec<String> = statement
@@ -213,9 +224,9 @@ pub fn get_possible_pairs() -> Result<HashMap<String, Vec<VendorRenderer>>> {
     Ok(result)
 }
 
-fn weighted_random_choice(weights: &[f64]) -> usize {
+fn weighted_random_choice(weights: &[f64], rng: &mut impl Rng) -> usize {
     let sum: f64 = weights.iter().sum();
-    let threshold: f64 = rand::thread_rng().gen::<f64>() * sum;
+    let threshold: f64 = rng.gen::<f64>() * sum;
     let mut cumulative = 0.0;
     for (i, weight) in weights.iter().enumerate() {
         cumulative += weight;
