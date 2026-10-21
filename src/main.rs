@@ -562,11 +562,6 @@ fn launch_options(
                 .unwrap_or_default()
                 .to_string()
         });
-    let zh_cn_font = persona
-        .metadata
-        .get("zh_cn_font")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
     let mut options = LaunchOptions {
         os: vec![persona_os(&persona)?],
         persona: Some(persona),
@@ -592,14 +587,6 @@ fn launch_options(
         ff_version: Some(ff_version),
         ..Default::default()
     };
-    if let Some(font) = zh_cn_font {
-        options.fonts.push(font.clone());
-        for generic in ["serif", "sans-serif", "monospace"] {
-            options
-                .firefox_user_prefs
-                .insert(format!("font.name-list.{generic}.zh-CN"), json!(font));
-        }
-    }
     // Apply proxy prefs before Firefox's startup networking.
     if let Some(proxy) = proxy {
         proxy.apply_firefox_prefs(&mut options.firefox_user_prefs);
@@ -823,6 +810,13 @@ fn update_launch_geo(paths: &Paths, prepared: &mut PreparedLaunch, geo: &Profile
         .and_then(Value::as_str)
         .context("saved launch has no user agent")?;
     let target_os = determine_ua_os(user_agent)?;
+    prepared.config.insert(
+        "fonts".into(),
+        json!(camoufox_core::mappings::fonts::fonts_for_locale(
+            target_os,
+            &geo.locale
+        )),
+    );
     prepared
         .env
         .retain(|key, _| !key.starts_with("CAMOU_CONFIG_"));
@@ -1278,7 +1272,7 @@ mod tests {
     use rust_browser::launch_progress::read_events;
 
     #[test]
-    fn first_launch_uses_font_saved_at_profile_creation() {
+    fn launch_does_not_force_host_chinese_font() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
         let mut persona = PersonaRecord::generate(
@@ -1290,31 +1284,63 @@ mod tests {
         )
         .unwrap();
         persona.metadata.insert("os".into(), json!("linux"));
-        persona
-            .metadata
-            .insert("zh_cn_font".into(), json!("PingFang SC"));
         let installation = ActiveInstallation {
             root: paths.browser(),
             version: CamoufoxVersion::new("beta.31", Some("152.0.4".into())),
             executable_path: paths.browser().join("camoufox"),
         };
-        let mut old_persona = persona.clone();
-        old_persona.metadata.remove("zh_cn_font");
         let options =
             launch_options(&paths, "chinese-profile", persona, None, &installation).unwrap();
-        assert_eq!(options.fonts, ["PingFang SC"]);
-        assert_eq!(
-            options.firefox_user_prefs["font.name-list.sans-serif.zh-CN"],
-            json!("PingFang SC")
-        );
-        let old_options =
-            launch_options(&paths, "old-profile", old_persona, None, &installation).unwrap();
-        assert!(old_options.fonts.is_empty());
+        assert!(options.fonts.is_empty());
         assert!(
-            !old_options
+            !options
                 .firefox_user_prefs
                 .contains_key("font.name-list.sans-serif.zh-CN")
         );
+    }
+
+    #[test]
+    fn refreshing_region_updates_fonts_for_the_simulated_os() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf())).unwrap();
+        let mut prepared = PreparedLaunch {
+            executable_path: paths.browser().join("camoufox.exe"),
+            env: BTreeMap::new(),
+            firefox_user_prefs: BTreeMap::new(),
+            args: Vec::new(),
+            proxy: None,
+            proxy_bypass: None,
+            spoofs_window_dimensions: false,
+            config: serde_json::from_value(json!({
+                "navigator.userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/152.0",
+                "fonts": ["PingFang SC"],
+            })).unwrap(),
+        };
+        let mut geo = ProfileGeo {
+            ip: "203.0.113.1".into(),
+            country_code: "CN".into(),
+            country: "China".into(),
+            region: None,
+            region_code: None,
+            city: None,
+            timezone: "Asia/Shanghai".into(),
+            latitude: 31.2,
+            longitude: 121.5,
+            locale: "zh-CN".into(),
+            source: "test".into(),
+        };
+        update_launch_geo(&paths, &mut prepared, &geo).unwrap();
+        let fonts = prepared.config["fonts"].as_array().unwrap();
+        assert!(fonts.contains(&json!("Microsoft YaHei")));
+        assert!(!fonts.contains(&json!("PingFang SC")));
+        geo.locale = "fr-FR".into();
+        geo.timezone = "Europe/Paris".into();
+        update_launch_geo(&paths, &mut prepared, &geo).unwrap();
+        assert_eq!(prepared.config["locale:language"], json!("fr"));
+        let fonts = prepared.config["fonts"].as_array().unwrap();
+        assert!(fonts.contains(&json!("Arial")));
+        assert!(!fonts.contains(&json!("Microsoft YaHei")));
+        assert!(!prepared.env.is_empty());
     }
 
     #[test]

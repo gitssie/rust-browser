@@ -566,11 +566,6 @@ impl ProfileService {
             .insert("os".into(), json!(input.os.supported().as_str()));
         record.metadata.insert("tabs".into(), json!(tabs));
         record.metadata.insert("geo".into(), json!(geo));
-        if cfg!(target_os = "macos") && geo.locale.eq_ignore_ascii_case("zh-CN") {
-            record
-                .metadata
-                .insert("zh_cn_font".into(), json!("PingFang SC"));
-        }
         const FIREFOX_VERSIONS: [&str; 3] = ["151", "152", "153"];
         let version = FIREFOX_VERSIONS[rand::thread_rng().gen_range(0..FIREFOX_VERSIONS.len())];
         record
@@ -1049,7 +1044,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn created_chinese_profile_saves_font_identity() {
+    async fn created_chinese_profile_does_not_save_host_font_override() {
         let dir = tempfile::tempdir().unwrap();
         let service = ProfileService::new(dir.path(), "socks5://127.0.0.1:12334").unwrap();
         let mut chinese_geo = geo();
@@ -1070,10 +1065,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            record.metadata.get("zh_cn_font"),
-            cfg!(target_os = "macos").then_some(&json!("PingFang SC"))
-        );
+        assert!(!record.metadata.contains_key("zh_cn_font"));
     }
 
     #[tokio::test]

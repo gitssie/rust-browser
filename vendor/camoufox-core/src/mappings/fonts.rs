@@ -831,3 +831,305 @@ pub fn fonts_for(os: crate::os::OsName) -> &'static [&'static str] {
         crate::os::OsName::Lin => LIN_FONTS,
     }
 }
+
+/// A stable OS baseline plus fonts for the profile's primary language/script.
+/// Do not expose every regional font in the bundled OS catalog to every locale.
+/// Names are selected from that catalog, never from the host's installed fonts.
+pub fn fonts_for_locale(os: crate::os::OsName, locale: &str) -> Vec<&'static str> {
+    const BASE: &[&str] = &[
+        "Arial",
+        "Arial Black",
+        "Arial Narrow",
+        "Arial Rounded MT Bold",
+        "Calibri",
+        "Calibri Light",
+        "Cambria",
+        "Cambria Math",
+        "Candara",
+        "Comic Sans MS",
+        "Consolas",
+        "Constantia",
+        "Corbel",
+        "Courier",
+        "Courier New",
+        "Georgia",
+        "Helvetica",
+        "Helvetica Neue",
+        "Impact",
+        "Lucida Console",
+        "Lucida Grande",
+        "Lucida Sans Unicode",
+        "Menlo",
+        "Monaco",
+        "Palatino",
+        "Palatino Linotype",
+        "Segoe UI",
+        "Segoe UI Emoji",
+        "Segoe UI Symbol",
+        "Segoe UI Variable",
+        "Symbol",
+        "Tahoma",
+        "Times",
+        "Times New Roman",
+        "Trebuchet MS",
+        "Verdana",
+        "Webdings",
+        "Wingdings",
+        "Apple Color Emoji",
+        "Apple Symbols",
+        "System Font",
+        ".SF NS",
+        ".SF NS Mono",
+        ".SF NS Rounded",
+        "Avenir",
+        "Avenir Next",
+        "Baskerville",
+        "Futura",
+        "Geneva",
+        "Optima",
+        "San Francisco",
+        "Arimo",
+        "Cousine",
+        "Tinos",
+        "STIX Two Math",
+        "STIX Two Text",
+        "Twemoji Mozilla",
+    ];
+    let locale = locale.to_ascii_lowercase();
+    let parts: Vec<_> = locale.split('-').collect();
+    // Explicit script wins over language defaults, including transliterations.
+    let script = parts.iter().find(|part| part.len() == 4).copied();
+    let language = match script {
+        Some("arab") => "ar",
+        Some("hebr") => "he",
+        Some("deva") => "hi",
+        Some("beng") => "bn",
+        Some("guru") => "pa",
+        Some("gujr") => "gu",
+        Some("taml") => "ta",
+        Some("telu") => "te",
+        Some("knda") => "kn",
+        Some("mlym") => "ml",
+        Some("orya") => "or",
+        Some("sinh") => "si",
+        Some("thai") => "th",
+        Some("laoo") => "lo",
+        Some("khmr") => "km",
+        Some("mymr") => "my",
+        Some("tibt") => "bo",
+        Some("armn") => "hy",
+        Some("geor") => "ka",
+        Some("ethi") => "am",
+        Some("thaa") => "dv",
+        Some("cher") => "chr",
+        Some("cans") => "iu",
+        Some("mong") => "mn",
+        Some("hans" | "hant" | "hani") => "zh",
+        Some("jpan") => "ja",
+        Some("kore" | "hang") => "ko",
+        Some("latn" | "cyrl" | "grek") => "",
+        _ if parts[0] == "pa" && parts.contains(&"pk") => "ar",
+        _ => parts[0],
+    };
+    // An explicit script takes precedence over region (e.g. zh-Hant-CN).
+    let traditional = if parts.contains(&"hans") {
+        false
+    } else {
+        parts.contains(&"hant") || parts.iter().any(|p| ["tw", "hk", "mo"].contains(p))
+    };
+    let regional: &[&str] = match language {
+        "zh" if traditional && !parts.contains(&"hans") => {
+            if parts.iter().any(|p| ["hk", "mo"].contains(p)) {
+                &[
+                    "PingFang HK",
+                    "Heiti TC",
+                    "Songti TC",
+                    "Microsoft JhengHei",
+                    "MingLiU",
+                    "PMingLiU",
+                    "Noto Sans TC",
+                ]
+            } else {
+                &[
+                    "PingFang TC",
+                    "Heiti TC",
+                    "Songti TC",
+                    "Microsoft JhengHei",
+                    "MingLiU",
+                    "PMingLiU",
+                    "Noto Sans TC",
+                ]
+            }
+        }
+        "zh" => &[
+            "PingFang SC",
+            "Heiti SC",
+            "Songti SC",
+            "STSong",
+            "Hiragino Sans GB",
+            "GB18030 Bitmap",
+            "Microsoft YaHei",
+            "SimSun",
+            "NSimSun",
+            "Noto Sans SC",
+        ],
+        "ja" => &[
+            "Hiragino",
+            "Yu Gothic",
+            "MS Gothic",
+            "MS PGothic",
+            "MS UI Gothic",
+            "Noto Sans JP",
+        ],
+        "ko" => &[
+            "Apple SD Gothic Neo",
+            "AppleGothic",
+            "AppleMyungjo",
+            "Malgun Gothic",
+            "Noto Sans KR",
+        ],
+        "ar" | "fa" | "ur" | "ps" => &[
+            "Arabic",
+            "Naskh",
+            "Nastaliq",
+            "Al Bayan",
+            "Al Nile",
+            "Al Tarikh",
+            "Baghdad",
+            "Beirut",
+            "Damascus",
+            "Diwan",
+            "Farah",
+            "Farisi",
+            "Geeza",
+            "Kufi",
+            "Mishafi",
+            "Muna",
+            "Nadeem",
+            "Sana",
+            "Waseem",
+        ],
+        "he" | "yi" => &["Hebrew", "New Peninim", "Raanana"],
+        "hi" | "mr" | "ne" | "sa" => &["Devanagari", "Nirmala UI"],
+        "bn" | "as" => &["Bengali", "Bangla", "Nirmala UI"],
+        "pa" => &["Gurmukhi", "Mukta", "Nirmala UI"],
+        "gu" => &["Gujarati", "Nirmala UI"],
+        "ta" => &["Tamil", "InaiMathi", "Nirmala UI"],
+        "te" => &["Telugu", "Nirmala UI"],
+        "kn" => &["Kannada", "Nirmala UI"],
+        "ml" => &["Malayalam", "Nirmala UI"],
+        "or" => &["Oriya", "Nirmala UI"],
+        "si" => &["Sinhala", "Nirmala UI"],
+        "th" => &[
+            "Thai",
+            "Thonburi",
+            "Ayuthaya",
+            "Krungthep",
+            "Sathu",
+            "Silom",
+            "Sukhumvit",
+            "Leelawadee",
+        ],
+        "lo" => &["Lao", "Leelawadee"],
+        "km" => &["Khmer", "Leelawadee"],
+        "my" => &["Myanmar", "Zawgyi"],
+        "bo" | "dz" => &["Tibetan", "Kailasa", "Kokonor", "Microsoft Himalaya"],
+        "hy" => &["Armenian", "Mshtakan"],
+        "ka" => &["Georgian"],
+        "am" | "ti" => &["Ethiopic", "Kefa", "Nyala"],
+        "dv" => &["Thaana", "MV Boli"],
+        "chr" => &["Cherokee"],
+        "iu" => &["Canadian Aboriginal", "CanAborig", "Euphemia"],
+        "mn" => &["Mongolian"],
+        _ => &[],
+    };
+    fonts_for(os)
+        .iter()
+        .copied()
+        .filter(|font| {
+            // Keep canonical names; the catalog also contains escaped localized
+            // aliases that are not separate font families.
+            if font.contains("\\u") {
+                return false;
+            }
+            BASE.contains(font)
+                || regional.iter().any(|name| {
+                    // Hiragino Sans GB is Chinese, despite sharing the Japanese prefix.
+                    if language == "ja" && font.contains("Sans GB") {
+                        return false;
+                    }
+                    *font == *name
+                        || font.starts_with(&format!("{name} "))
+                        || font.contains(&format!(" {name}"))
+                })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::os::OsName;
+
+    #[test]
+    fn western_locales_do_not_receive_east_asian_fonts() {
+        for os in [OsName::Win, OsName::Mac, OsName::Lin] {
+            for locale in ["en-US", "fr-FR", "de-DE"] {
+                let fonts = fonts_for_locale(os, locale);
+                assert!(!fonts.is_empty());
+                for font in fonts {
+                    assert!(
+                        !font.contains("PingFang")
+                            && !font.contains("YaHei")
+                            && !font.contains("SimSun")
+                            && !font.contains("Noto Sans SC")
+                            && !font.contains("Hiragino")
+                            && !font.contains("Malgun"),
+                        "{locale}: {font}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn regional_fonts_match_language_script_and_target_os() {
+        for (os, locale, expected, excluded) in [
+            (OsName::Win, "zh-CN", "Microsoft YaHei", "PingFang SC"),
+            (OsName::Mac, "zh-CN", "PingFang SC", "PingFang TC"),
+            (OsName::Lin, "zh-SG", "Noto Sans SC", "PingFang SC"),
+            (OsName::Mac, "zh-TW", "PingFang TC", "PingFang SC"),
+            (OsName::Mac, "zh-HK", "PingFang HK", "PingFang SC"),
+            (OsName::Mac, "zh-Hant-CN", "PingFang TC", "PingFang SC"),
+            (OsName::Win, "ja-JP", "Yu Gothic", "Microsoft YaHei"),
+            (OsName::Lin, "ko-KR", "Noto Sans KR", "Noto Sans SC"),
+            (OsName::Lin, "ar-SA", "Noto Naskh Arabic", "Noto Sans SC"),
+            (
+                OsName::Lin,
+                "pa-Arab-PK",
+                "Noto Naskh Arabic",
+                "Noto Sans Gurmukhi",
+            ),
+            (
+                OsName::Lin,
+                "pa-PK",
+                "Noto Naskh Arabic",
+                "Noto Sans Gurmukhi",
+            ),
+            (OsName::Lin, "zh-Latn-CN", "Arimo", "Noto Sans SC"),
+            (OsName::Lin, "hi-IN", "Noto Sans Devanagari", "Noto Sans SC"),
+        ] {
+            let fonts = fonts_for_locale(os, locale);
+            assert!(fonts.contains(&expected), "{locale}: missing {expected}");
+            assert!(
+                !fonts.contains(&excluded),
+                "{locale}: unexpected {excluded}"
+            );
+            assert!(fonts.iter().all(|font| fonts_for(os).contains(font)));
+        }
+        assert_eq!(
+            fonts_for_locale(OsName::Mac, "EN-us"),
+            fonts_for_locale(OsName::Mac, "en-US")
+        );
+    }
+}

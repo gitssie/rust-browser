@@ -300,11 +300,9 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
     );
 
     // Seeds (spacing/audio/canvas): only what the installed browser declares.
-    let known_properties = camoufox_core::config::load_properties(
-        options.executable_path.as_deref(),
-        &install_root,
-    )
-    .unwrap_or_default();
+    let known_properties =
+        camoufox_core::config::load_properties(options.executable_path.as_deref(), &install_root)
+            .unwrap_or_default();
     for seed in SEED_PROPERTIES {
         if known_properties.contains_key(*seed) {
             set_into(
@@ -327,48 +325,6 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
         "window.history.length",
         Value::from(rand::Rng::gen_range(&mut rand::thread_rng(), 1..=5)),
     );
-
-    // Fonts.
-    if !options.fonts.is_empty() {
-        config.insert(
-            "fonts".into(),
-            Value::Array(
-                options
-                    .fonts
-                    .iter()
-                    .map(|f| Value::String(f.clone()))
-                    .collect(),
-            ),
-        );
-    }
-
-    if options.custom_fonts_only {
-        firefox_user_prefs.insert("gfx.bundled-fonts.activate".into(), Value::from(0));
-        if !options.fonts.is_empty() {
-            warnings::warn_leak("custom_fonts_only", Some(options.i_know_what_im_doing));
-        } else {
-            return Err(CamoufoxError::Io(
-                "No custom fonts were passed, but `custom_fonts_only` is enabled.".into(),
-            ));
-        }
-    } else {
-        let os_fonts = camoufox_core::mappings::fonts::fonts_for(target_os);
-        let merged: Vec<Value> = {
-            let mut seen = std::collections::HashSet::new();
-            let mut list: Vec<Value> = Vec::new();
-            for font in os_fonts
-                .iter()
-                .map(|f| (*f).to_string())
-                .chain(options.fonts.clone())
-            {
-                if seen.insert(font.clone()) {
-                    list.push(Value::String(font));
-                }
-            }
-            list
-        };
-        config.insert("fonts".into(), Value::Array(merged));
-    }
 
     // Proxy URL.
     let proxy_url = options.proxy.as_ref().map(proxy_to_url);
@@ -416,6 +372,65 @@ pub async fn prepare(options: &LaunchOptions) -> Result<PreparedLaunch> {
     // Locale.
     if !options.locale.is_empty() {
         handle_locales(&options.locale, &mut config)?;
+    }
+
+    // Fonts.
+    if !options.fonts.is_empty() {
+        config.insert(
+            "fonts".into(),
+            Value::Array(
+                options
+                    .fonts
+                    .iter()
+                    .map(|f| Value::String(f.clone()))
+                    .collect(),
+            ),
+        );
+    }
+
+    if options.custom_fonts_only {
+        firefox_user_prefs.insert("gfx.bundled-fonts.activate".into(), Value::from(0));
+        if !options.fonts.is_empty() {
+            warnings::warn_leak("custom_fonts_only", Some(options.i_know_what_im_doing));
+        } else {
+            return Err(CamoufoxError::Io(
+                "No custom fonts were passed, but `custom_fonts_only` is enabled.".into(),
+            ));
+        }
+    } else {
+        let language = config
+            .get("locale:language")
+            .and_then(Value::as_str)
+            .unwrap_or("en");
+        let script = config
+            .get("locale:script")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let region = config
+            .get("locale:region")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let locale = [language, script, region]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("-");
+        let os_fonts = camoufox_core::mappings::fonts::fonts_for_locale(target_os, &locale);
+        let merged: Vec<Value> = {
+            let mut seen = std::collections::HashSet::new();
+            let mut list: Vec<Value> = Vec::new();
+            for font in os_fonts
+                .iter()
+                .map(|f| (*f).to_string())
+                .chain(options.fonts.clone())
+            {
+                if seen.insert(font.clone()) {
+                    list.push(Value::String(font));
+                }
+            }
+            list
+        };
+        config.insert("fonts".into(), Value::Array(merged));
     }
 
     // Humanize.
